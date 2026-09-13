@@ -7,6 +7,7 @@
 	import { openSettingsModal } from '$frontend/stores/ui/settings-modal.svelte';
 	import { addNotification } from '$frontend/stores/ui/notification.svelte';
 	import ToolsMenu from '$frontend/components/workspace/ToolsMenu.svelte';
+	import WorktreeSwitcher from '$frontend/components/worktree/WorktreeSwitcher.svelte';
 	import TunnelModal from '$frontend/components/tunnel/TunnelModal.svelte';
 	import RemoteAccessPanel from '$frontend/components/remote-access/RemoteAccessPanel.svelte';
 	import DbClientModal from '$frontend/components/db-client/DbClientModal.svelte';
@@ -14,10 +15,14 @@
 	import PortsModal from '$frontend/components/ports/PortsModal.svelte';
 	import ContainersModal from '$frontend/components/containers/ContainersModal.svelte';
 	import MemoryModal from '$frontend/components/memory/MemoryModal.svelte';
+	import NotesModal from '$frontend/components/notes/NotesModal.svelte';
+	import WorkModal from '$frontend/components/work/WorkModal.svelte';
+	import DeploymentsModal from '$frontend/components/deployments/DeploymentsModal.svelte';
 	import SettingButton from '$frontend/components/settings/SettingButton.svelte';
 	import type { Project } from '$shared/types/database/schema';
 	import FolderBrowser from '$frontend/components/common/form/FolderBrowser.svelte';
 	import ProjectUserAvatars from '$frontend/components/common/display/ProjectUserAvatars.svelte';
+	import ProjectInfoModal from '$frontend/components/workspace/ProjectInfoModal.svelte';
 	import { authStore } from '$frontend/stores/features/auth.svelte';
 	import ws from '$frontend/utils/ws';
 	import { debug } from '$shared/utils/logger';
@@ -38,7 +43,13 @@
 		openContainersDialog,
 		closePortsDialog,
 		openMemoryDialog,
-		closeMemoryDialog
+		closeMemoryDialog,
+		openNotesDialog,
+		closeNotesDialog,
+		openWorkDialog,
+		closeWorkDialog,
+		openDeploymentsDialog,
+		closeDeploymentsDialog
 	} from '$frontend/stores/ui/quick-panels.svelte';
 	import { openCommandPalette } from '$frontend/stores/ui/command-palette.svelte';
 
@@ -46,6 +57,8 @@
 	let showProjectMenu = $state(false);
 	let showDeleteDialog = $state(false);
 	let projectToDelete = $state<Project | null>(null);
+	let showProjectInfo = $state(false);
+	let projectInfoProject = $state<Project | null>(null);
 	let searchQuery = $state('');
 
 	const canManageProjects = $derived(authStore.isAdmin);
@@ -89,6 +102,16 @@
 		event.stopPropagation();
 		projectToDelete = project;
 		showDeleteDialog = true;
+	}
+
+	function handleInfoClick(project: Project, event: MouseEvent) {
+		event.stopPropagation();
+		projectInfoProject = project;
+		showProjectInfo = true;
+	}
+
+	function closeProjectInfo() {
+		showProjectInfo = false;
 	}
 
 	let deletingProject = $state(false);
@@ -177,6 +200,7 @@
 		aria-label="Action Buttons"
 	>
 		<!-- Tools (Remote Access, Public Tunnel, DB Client) -->
+		<WorktreeSwitcher collapsed={true} mobile={true} />
 		<ToolsMenu
 			collapsed={true}
 			mobile={true}
@@ -187,6 +211,9 @@
 					onPorts={openPortsDialog}
 					onContainers={openContainersDialog}
 					onMemory={openMemoryDialog}
+					onNotes={openNotesDialog}
+					onWork={() => openWorkDialog()}
+					onDeployments={() => openDeploymentsDialog()}
 		/>
 
 		<!-- Quick Search Button -->
@@ -330,6 +357,15 @@
 							</div>
 						</button>
 						<ProjectUserAvatars projectStatus={presenceState.statuses.get(project.id ?? '')} maxVisible={2} />
+						<button
+							type="button"
+							class="flex items-center justify-center w-8 h-8 bg-transparent border-none rounded-lg text-slate-400 dark:text-slate-500 cursor-pointer transition-all duration-150 hover:bg-violet-500/10 hover:text-violet-600 shrink-0"
+							onclick={(e) => handleInfoClick(project, e)}
+							aria-label="Project info"
+							title="Info"
+						>
+							<Icon name="lucide:info" class="w-4 h-4" />
+						</button>
 						{#if canManageProjects}
 							<button
 								type="button"
@@ -434,3 +470,16 @@
 <PortsModal bind:isOpen={quickPanelsState.portsOpen} onClose={closePortsDialog} />
 <ContainersModal bind:isOpen={quickPanelsState.containersOpen} onClose={closeContainersDialog} />
 <MemoryModal bind:isOpen={quickPanelsState.memoryOpen} onClose={closeMemoryDialog} />
+<NotesModal bind:isOpen={quickPanelsState.notesOpen} onClose={closeNotesDialog} />
+<DeploymentsModal
+	bind:isOpen={quickPanelsState.deploymentsOpen}
+	onClose={closeDeploymentsDialog}
+/>
+
+<WorkModal
+	bind:isOpen={quickPanelsState.workOpen}
+	composePullRequest={quickPanelsState.workComposePr}
+	onClose={closeWorkDialog}
+/>
+
+<ProjectInfoModal bind:isOpen={showProjectInfo} onClose={closeProjectInfo} project={projectInfoProject} />

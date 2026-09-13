@@ -11,9 +11,12 @@
  *   not expose it (only NVIDIA via nvidia-smi typically does), so util fields
  *   are `null` when unavailable rather than a misleading `0`.
  *
- * Static facts (OS, CPU model, core count, GPU model, virtualization) are
- * captured once per process; dynamic metrics (load, memory, battery, disk,
- * GPU utilization) are recomputed on every request so the panel can poll live.
+ * Static facts (OS, CPU model, core count, installed RAM, GPU model,
+ * virtualization) come from `backend/host/metrics.ts`, which probes them once
+ * per process and is also what Project Info reads, so the two panels cannot
+ * disagree about the machine they are describing. Dynamic metrics (load,
+ * memory in use, battery, disk, GPU utilization) are recomputed on every
+ * request so the panel can poll live.
  */
 
 import { t } from 'elysia';
@@ -21,62 +24,16 @@ import os from 'node:os';
 import si from 'systeminformation';
 import type { Systeminformation } from 'systeminformation';
 import { createRouter } from '$shared/utils/ws-server';
+import { getHostFacts, withTimeout } from '../../host/metrics';
 
-interface StaticInfo {
-	hostname: string;
-	platform: string;
-	distro: string;
-	release: string;
-	kernel: string;
-	arch: string;
-	isVirtual: boolean;
-	cpuBrand: string;
-	cpuManufacturer: string;
-	physicalCores: number;
-	logicalCores: number;
-	cpuSpeedGhz: number | null;
-	gpus: Array<{ model: string; vendor: string; vramMb: number | null }>;
-}
-
-/** Static facts don't change while the process runs — resolve them once. */
-let staticInfoPromise: Promise<StaticInfo> | null = null;
-
-async function getStaticInfo(): Promise<StaticInfo> {
-	if (!staticInfoPromise) {
-		staticInfoPromise = (async () => {
-			const [osInfo, cpu, system, graphics] = await Promise.all([
-				si.osInfo(),
-				si.cpu(),
-				si.system(),
-				si.graphics()
-			]);
-			return {
-				hostname: osInfo.hostname || os.hostname(),
-				platform: osInfo.platform,
-				distro: osInfo.distro,
-				release: osInfo.release,
-				kernel: osInfo.kernel,
-				arch: osInfo.arch || os.arch(),
-				isVirtual: Boolean(system.virtual),
-				cpuBrand: cpu.brand,
-				cpuManufacturer: cpu.manufacturer,
-				physicalCores: cpu.physicalCores || cpu.cores,
-				logicalCores: cpu.cores,
-				cpuSpeedGhz: typeof cpu.speed === 'number' && cpu.speed > 0 ? cpu.speed : null,
-				gpus: graphics.controllers.map((c) => ({
-					model: c.model || 'Unknown GPU',
-					vendor: c.vendor || 'Unknown',
-					vramMb: typeof c.vram === 'number' && c.vram > 0 ? c.vram : null
-				}))
-			};
-		})().catch((err) => {
-			// Don't cache a failed probe — allow the next request to retry.
-			staticInfoPromise = null;
-			throw err;
-		});
-	}
-	return staticInfoPromise;
-}
+/** Last-good caches for dynamic probes: prevents transient WMI timeouts from
+ *  flickering the UI between "This Device" <-> "Server" or dropping Storage cards. */
+let lastMemCache: Systeminformation.MemData | null = null;
+let lastBatteryCache: Systeminformation.BatteryData | null = null;
+let lastFsSizeCache: Systeminformation.FsSizeData[] | null = null;
+let lastLoadCache: Systeminformation.CurrentLoadData | null = null;
+let lastGraphicsCache: Systeminformation.GraphicsData | null = null;
+let lastNetCache: Systeminformation.NetworkInterfacesData | null = null;
 
 const GpuSchema = t.Object({
 	model: t.String(),
@@ -210,27 +167,40 @@ export const deviceInfoHandler = createRouter()
 			disks: t.Array(DiskSchema)
 		})
 	}, async () => {
-		const staticInfo = await getStaticInfo();
+		const facts = await getHostFacts();
 
 		const [load, mem, battery, graphics, fsSize, netDefault] = await Promise.all([
-			si.currentLoad(),
-			si.mem(),
-			si.battery(),
-			si.graphics(),
-			si.fsSize(),
-			si.networkInterfaces('default')
+			withTimeout(si.currentLoad(), 3500),
+			withTimeout(si.mem(), 3500),
+			withTimeout(si.battery(), 3500),
+			withTimeout(si.graphics(), 3500),
+			withTimeout(si.fsSize(), 3500),
+			withTimeout(si.networkInterfaces('default'), 3500)
 		]);
 
-		// networkInterfaces('default') returns the single default interface, but
-		// normalize defensively in case a build returns an array.
-		const net = Array.isArray(netDefault) ? netDefault[0] : netDefault;
+		// Update last-good caches; reuse them when a probe times out so the UI
+		// doesn't flicker between "This Device" <-> "Server" or drop Storage cards.
+		if (mem) lastMemCache = mem;
+		if (battery) lastBatteryCache = battery;
+		if (fsSize) lastFsSizeCache = fsSize;
+		if (load) lastLoadCache = load;
+		if (graphics) lastGraphicsCache = graphics;
+		if (netDefault) lastNetCache = Array.isArray(netDefault) ? netDefault[0] : netDefault;
+
+		const memEff = mem ?? lastMemCache;
+		const batteryEff = battery ?? lastBatteryCache;
+		const fsSizeEff = fsSize ?? lastFsSizeCache ?? [];
+		const loadEff = load ?? lastLoadCache;
+		const graphicsEff = graphics ?? lastGraphicsCache;
+		const netRawEff = netDefault ?? lastNetCache;
+		const net = Array.isArray(netRawEff) ? netRawEff[0] : netRawEff;
 
 		// avgLoad is 0/undefined on platforms without load average (e.g. Windows).
-		const loadAvg1 = typeof load.avgLoad === 'number' && load.avgLoad > 0 ? load.avgLoad : null;
+		const loadAvg1 = typeof loadEff?.avgLoad === 'number' && loadEff.avgLoad > 0 ? loadEff.avgLoad : null;
 
 		// Pair live GPU utilization with the cached controller identity by index.
-		const gpus = staticInfo.gpus.map((g, i) => {
-			const live = graphics.controllers[i];
+		const gpus = facts.gpus.map((g, i) => {
+			const live = graphicsEff?.controllers?.[i];
 			return {
 				model: g.model,
 				vendor: g.vendor,
@@ -242,32 +212,36 @@ export const deviceInfoHandler = createRouter()
 		});
 
 		// Show only the primary disk(s); collapses macOS APFS synthetic volumes.
-		const disks = selectPrimaryDisks(fsSize, staticInfo.platform);
+		const disks = selectPrimaryDisks(fsSizeEff, facts.platform);
 
 		return {
-			hostname: staticInfo.hostname,
-			platform: staticInfo.platform,
-			distro: staticInfo.distro,
-			release: staticInfo.release,
-			kernel: staticInfo.kernel,
-			arch: staticInfo.arch,
-			isVirtual: staticInfo.isVirtual,
+			hostname: facts.hostname,
+			platform: facts.platform,
+			distro: facts.distro,
+			release: facts.release,
+			kernel: facts.kernel,
+			arch: facts.arch,
+			isVirtual: facts.isVirtual,
 			uptimeSec: os.uptime(),
 			cpu: {
-				brand: staticInfo.cpuBrand,
-				manufacturer: staticInfo.cpuManufacturer,
-				physicalCores: staticInfo.physicalCores,
-				logicalCores: staticInfo.logicalCores,
-				speedGhz: staticInfo.cpuSpeedGhz,
-				loadPercent: typeof load.currentLoad === 'number' ? load.currentLoad : 0,
+				brand: facts.cpuBrand,
+				manufacturer: facts.cpuManufacturer,
+				physicalCores: facts.physicalCores,
+				logicalCores: facts.logicalCores,
+				speedGhz: facts.cpuSpeedGhz,
+				// Percent of total machine capacity — the same basis Project Info
+				// normalises its per-project figure to, so the two are comparable.
+				loadPercent: typeof loadEff?.currentLoad === 'number' ? loadEff.currentLoad : 0,
 				loadAvg1
 			},
 			memory: {
-				totalBytes: mem.total,
-				usedBytes: mem.active,
-				freeBytes: mem.available,
-				swapTotalBytes: mem.swaptotal,
-				swapUsedBytes: mem.swapused
+				// Installed RAM comes from the shared host facts so this total and
+				// the one Project Info divides by are always the same number.
+				totalBytes: facts.totalMemBytes,
+				usedBytes: memEff?.active ?? os.totalmem() - os.freemem(),
+				freeBytes: memEff?.available ?? os.freemem(),
+				swapTotalBytes: memEff?.swaptotal ?? 0,
+				swapUsedBytes: memEff?.swapused ?? 0
 			},
 			network: {
 				iface: net?.iface || '',
@@ -275,13 +249,13 @@ export const deviceInfoHandler = createRouter()
 				mac: net?.mac || ''
 			},
 			battery: {
-				hasBattery: Boolean(battery.hasBattery),
-				percent: typeof battery.percent === 'number' && battery.hasBattery ? battery.percent : null,
-				isCharging: Boolean(battery.isCharging),
-				acConnected: Boolean(battery.acConnected),
+				hasBattery: Boolean(batteryEff?.hasBattery),
+				percent: typeof batteryEff?.percent === 'number' && batteryEff.hasBattery ? batteryEff.percent : null,
+				isCharging: Boolean(batteryEff?.isCharging),
+				acConnected: Boolean(batteryEff?.acConnected),
 				timeRemainingMinutes:
-					typeof battery.timeRemaining === 'number' && battery.timeRemaining > 0
-						? battery.timeRemaining
+					typeof batteryEff?.timeRemaining === 'number' && batteryEff.timeRemaining > 0
+						? batteryEff.timeRemaining
 						: null
 			},
 			gpus,

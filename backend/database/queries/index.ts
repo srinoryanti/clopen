@@ -5,6 +5,7 @@ export { messageQueries } from './message-queries';
 export { settingsQueries } from './settings-queries';
 export { dbUtils } from './utils-queries';
 export { snapshotQueries } from './snapshot-queries';
+export { worktreeQueries } from './worktree-queries';
 export { checkpointQueries } from './checkpoint-queries';
 export { engineQueries } from './engine-queries';
 export { authQueries } from './auth-queries';
@@ -31,3 +32,10 @@ export { graphQueries, deriveDigest, entityKeyFor, DIGEST_VERSION } from './grap
 export { memoryQueueQueries, type QueuedExtraction } from './memory-queue-queries';
 export { profileQueries, PROFILE_ITEM_TYPES } from './profile-queries';
 export type { ProfileRow, ProfileItemRow, ProfileInput, ProfileItemInput, ProfileItemType } from './profile-queries';
+export { noteQueries, noteCollectionQueries, noteImageQueries } from './note-queries';
+export { integrationAccountQueries, integrationProjectionQueries, integrationWebhookQueries } from './integration-queries';
+export type { IntegrationAccountRow, IntegrationAccountInput, IntegrationProjectionRow } from './integration-queries';
+export { workBindingQueries, workLinkQueries, parseBindingConfig } from './work-queries';
+export type { WorkBindingRow, WorkLinkRow } from './work-queries';
+export { deployBindingQueries, parseDeployConfig } from './deploy-queries';
+export type { DeployBindingRow } from './deploy-queries';

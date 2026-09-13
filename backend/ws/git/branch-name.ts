@@ -7,6 +7,7 @@
 import { t } from 'elysia';
 import { createRouter } from '$shared/utils/ws-server';
 import { execGit } from '../../git/git-executor';
+import { buildBudgetedStagedDiff, BRANCH_NAME_BUDGET } from './diff-budget';
 import { initializeEngine } from '../../engine';
 import { resolveGenerationTarget } from '../../engine/resolve-model';
 import type { EngineType } from '$shared/types/unified';
@@ -19,7 +20,7 @@ import {
 	TEST_BRANCH_NAME_PREFIX
 } from '$shared/constants/git';
 import { debug } from '$shared/utils/logger';
-import { requireProjectAccess } from '../access';
+import { requireProjectWorkspace } from '../access';
 
 const INVALID_BRANCH_SEPARATOR_CHARS = /[\s\0~^:?*[\]\\]+/g;
 const GENERATED_BRANCH_PREFIXES = [
@@ -144,13 +145,13 @@ export const branchNameHandler = createRouter()
 			branchName: t.String()
 		})
 	}, async ({ data, conn }) => {
-		const project = requireProjectAccess(conn, data.projectId);
-		const cwd = resolveRepoCwd(project.path, data.repoPath);
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
 
-		const diffResult = await execGit(['diff', '--cached'], cwd);
-		const rawDiff = diffResult.stdout;
-
-		if (!rawDiff.trim()) {
+		// A branch name is a topic, not a description — the file list carries nearly
+		// all the signal, so this budget is much tighter than the commit-message one.
+		const diff = await buildBudgetedStagedDiff(cwd, BRANCH_NAME_BUDGET);
+		if (diff.isEmpty) {
 			throw new Error('No staged changes to generate a branch name for');
 		}
 
@@ -167,7 +168,7 @@ export const branchNameHandler = createRouter()
 		const separator = normalizeBranchSeparator(data.branchSeparator);
 		const instructions = createBranchNameInstructions(currentBranch, prefix, separator);
 		const extra = data.customPrompt?.trim();
-		const prompt = `${instructions}${extra ? `\n\nAdditional constraints:\n${extra}` : ''}\n\nGit diff:\n${rawDiff}`;
+		const prompt = `${instructions}${extra ? `\n\nAdditional constraints:\n${extra}` : ''}\n\n${diff.text}`;
 
 		// The caller's providerSlug/account can be stale (see resolve-model.ts).
 		const target = await resolveGenerationTarget(engine, data.modelId, data.providerSlug);

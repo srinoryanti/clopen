@@ -10,6 +10,7 @@ export type LogLabel =
 	| 'chat'
 	| 'checkpoint'
 	| 'snapshot'
+	| 'worktree'
 	
 	// Preview
 	| 'preview'
@@ -27,6 +28,9 @@ export type LogLabel =
 	// Communication
 	| 'websocket'
 	| 'mcp'
+	| 'integrations'
+	| 'work'
+	| 'deployments'
 	| 'skills'
 	| 'artifacts'
 	| 'commands'
@@ -41,6 +45,7 @@ export type LogLabel =
 	// Configuration
 	| 'project'
 	| 'workspace'
+	| 'notes'
 	| 'settings'
 	| 'engine'
 	| 'tunnel'

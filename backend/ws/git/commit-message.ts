@@ -6,13 +6,13 @@
 
 import { t } from 'elysia';
 import { createRouter } from '$shared/utils/ws-server';
-import { execGit } from '../../git/git-executor';
+import { buildBudgetedStagedDiff, COMMIT_MESSAGE_BUDGET } from './diff-budget';
 import { initializeEngine } from '../../engine';
 import { resolveGenerationTarget } from '../../engine/resolve-model';
 import type { EngineType } from '$shared/types/unified';
 import type { GeneratedCommitMessage } from '$shared/types/git';
 import { debug } from '$shared/utils/logger';
-import { requireProjectAccess } from '../access';
+import { requireProjectWorkspace } from '../access';
 
 // Schema is shaped to satisfy OpenAI's strict structured-output mode (used by
 // Codex via `outputSchema`): every object must declare `additionalProperties:
@@ -74,14 +74,12 @@ export const commitMessageHandler = createRouter()
 			message: t.String()
 		})
 	}, async ({ data, conn }) => {
-		const project = requireProjectAccess(conn, data.projectId);
-		const cwd = resolveRepoCwd(project.path, data.repoPath);
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
 
-		// Get raw staged diff text
-		const diffResult = await execGit(['diff', '--cached'], cwd);
-		const rawDiff = diffResult.stdout;
-
-		if (!rawDiff.trim()) {
+		// A budgeted view of the staged change, not the raw diff — see diff-budget.ts.
+		const diff = await buildBudgetedStagedDiff(cwd, COMMIT_MESSAGE_BUDGET);
+		if (diff.isEmpty) {
 			throw new Error('No staged changes to generate a commit message for');
 		}
 
@@ -96,16 +94,21 @@ export const commitMessageHandler = createRouter()
 			? 'Generate a multi-line conventional commit message with type, scope, subject, AND body fields. The body should explain WHY the change was made.'
 			: 'Generate a single-line conventional commit message with type, optional scope, and subject. Leave body empty.';
 
-		const defaultPrompt = `Analyze the following git diff and generate a conventional commit message.
+		// When the diff was sampled, say so: without this the model describes only
+		// the files it happened to see and writes a subject that misses the change.
+		const coverageNote = diff.truncated
+			? '\n- The diff below is a sample. Describe the change as a whole using the file list, not just the visible hunks.'
+			: '';
+
+		const defaultPrompt = `Analyze the following staged git change and generate a conventional commit message.
 
 Rules:
 - type: one of feat, fix, refactor, docs, test, chore, style, perf, ci, build
 - scope: optional, the area of the codebase affected (e.g., git, settings, engine)
 - subject: imperative mood, lowercase, no period at end, max 72 characters
-- ${formatInstruction}
+- ${formatInstruction}${coverageNote}
 
-Git diff:
-${rawDiff}`;
+${diff.text}`;
 
 		const extra = data.customPrompt?.trim();
 		const prompt = extra

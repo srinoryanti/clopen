@@ -21,6 +21,7 @@
 	import Dialog from '$frontend/components/common/overlay/Dialog.svelte';
 	import ViewMenu from '$frontend/components/workspace/ViewMenu.svelte';
 	import ToolsMenu from '$frontend/components/workspace/ToolsMenu.svelte';
+	import WorktreeSwitcher from '$frontend/components/worktree/WorktreeSwitcher.svelte';
 	import QuickSearchButton from '$frontend/components/workspace/QuickSearchButton.svelte';
 	import TunnelModal from '$frontend/components/tunnel/TunnelModal.svelte';
 	import RemoteAccessPanel from '$frontend/components/remote-access/RemoteAccessPanel.svelte';
@@ -29,8 +30,15 @@
 	import PortsModal from '$frontend/components/ports/PortsModal.svelte';
 	import ContainersModal from '$frontend/components/containers/ContainersModal.svelte';
 	import MemoryModal from '$frontend/components/memory/MemoryModal.svelte';
+	import NotesModal from '$frontend/components/notes/NotesModal.svelte';
+	import WorkModal from '$frontend/components/work/WorkModal.svelte';
+	import DeploymentsModal from '$frontend/components/deployments/DeploymentsModal.svelte';
 	import SettingButton from '$frontend/components/settings/SettingButton.svelte';
 	import ProjectUserAvatars from '$frontend/components/common/display/ProjectUserAvatars.svelte';
+	import ProjectInfoModal from '$frontend/components/workspace/ProjectInfoModal.svelte';
+	import ProjectContextMenu, {
+		type ProjectContextMenuItem
+	} from '$frontend/components/workspace/ProjectContextMenu.svelte';
 	import ws from '$frontend/utils/ws';
 	import {
 		quickPanelsState,
@@ -49,12 +57,20 @@
 		openContainersDialog,
 		closePortsDialog,
 		openMemoryDialog,
-		closeMemoryDialog
+		closeMemoryDialog,
+		openNotesDialog,
+		closeNotesDialog,
+		openWorkDialog,
+		closeWorkDialog,
+		openDeploymentsDialog,
+		closeDeploymentsDialog
 	} from '$frontend/stores/ui/quick-panels.svelte';
 
 	// State
 	let showDeleteDialog = $state(false);
 	let projectToDelete = $state<Project | null>(null);
+	let showProjectInfo = $state(false);
+	let projectInfoProject = $state<Project | null>(null);
 	let searchQuery = $state('');
 	let hoveredProject = $state<Project | null>(null);
 	let tooltipY = $state(0);
@@ -62,6 +78,9 @@
 	let draggedProjectId = $state<string | null>(null);
 	let dragOverProjectId = $state<string | null>(null);
 	let expandedListEl = $state<HTMLElement>();
+	let contextMenuProject = $state<Project | null>(null);
+	let contextMenuX = $state(0);
+	let contextMenuY = $state(0);
 	let collapsedListEl = $state<HTMLElement>();
 
 	// Derived
@@ -79,6 +98,15 @@
 			(p) => p.name.toLowerCase().includes(query) || p.path.toLowerCase().includes(query)
 		);
 	});
+
+	const contextMenuItems = $derived<ProjectContextMenuItem[]>(
+		canManageProjects
+			? [
+					{ id: 'info', label: 'Info', icon: 'lucide:info' },
+					{ id: 'delete', label: 'Delete', icon: 'lucide:trash-2', danger: true }
+				]
+			: [{ id: 'info', label: 'Info', icon: 'lucide:info' }]
+	);
 
 	// Auto-scroll the active project into view — covers both clicking it directly
 	// and switching to it from elsewhere (e.g. the Command Palette).
@@ -167,6 +195,40 @@
 		event.stopPropagation();
 		projectToDelete = project;
 		showDeleteDialog = true;
+	}
+
+	function handleInfoClick(project: Project, event: MouseEvent) {
+		event.stopPropagation();
+		projectInfoProject = project;
+		showProjectInfo = true;
+	}
+
+	function closeProjectInfo() {
+		showProjectInfo = false;
+	}
+
+	function openProjectContextMenu(project: Project, event: MouseEvent) {
+		event.preventDefault();
+		hideProjectTooltip();
+		contextMenuX = event.clientX;
+		contextMenuY = event.clientY;
+		contextMenuProject = project;
+	}
+
+	function closeProjectContextMenu() {
+		contextMenuProject = null;
+	}
+
+	function handleContextMenuSelect(action: string) {
+		const project = contextMenuProject;
+		if (!project) return;
+		if (action === 'info') {
+			projectInfoProject = project;
+			showProjectInfo = true;
+		} else if (action === 'delete' && canManageProjects) {
+			projectToDelete = project;
+			showDeleteDialog = true;
+		}
 	}
 
 	// Get project initials (max 2 characters)
@@ -329,6 +391,7 @@
 							ondrop={(event) => handleProjectDrop(event, project.id)}
 							ondragend={handleProjectDragEnd}
 							onclick={() => selectProject(project)}
+							oncontextmenu={(event) => openProjectContextMenu(project, event)}
 							onkeydown={(e) => e.key === 'Enter' && selectProject(project)}
 						>
 							<div class="relative shrink-0">
@@ -354,6 +417,15 @@
 								</div>
 								<div class="flex items-center gap-1 shrink-0">
 									<ProjectUserAvatars projectStatus={presenceState.statuses.get(project.id ?? '')} maxVisible={2} />
+									<button
+										type="button"
+										class="flex items-center justify-center w-6 h-6 bg-transparent border-none rounded-md text-slate-400 dark:text-slate-600 cursor-pointer transition-all duration-150 hover:bg-violet-500/10 hover:text-violet-600 shrink-0"
+										onclick={(e) => handleInfoClick(project, e)}
+										aria-label="Project info"
+										title="Info"
+									>
+										<Icon name="lucide:info" class="w-3.5 h-3.5" />
+									</button>
 									{#if canManageProjects}
 										<button
 											type="button"
@@ -393,6 +465,7 @@
 
 			<!-- Footer Actions -->
 			<footer class="flex flex-col p-3 border-t border-slate-200 dark:border-slate-800" in:fade={{ duration: 150 }}>
+				<WorktreeSwitcher />
 				<ToolsMenu
 					onRemoteAccess={openRemoteAccessDialog}
 					onPublicTunnel={openTunnelDialog}
@@ -401,6 +474,9 @@
 					onPorts={openPortsDialog}
 					onContainers={openContainersDialog}
 					onMemory={openMemoryDialog}
+					onNotes={openNotesDialog}
+					onWork={() => openWorkDialog()}
+					onDeployments={() => openDeploymentsDialog()}
 				/>
 				<QuickSearchButton />
 				<SettingButton onClick={() => openSettingsModal()} />
@@ -443,6 +519,7 @@
 						ondrop={(event) => handleProjectDrop(event, project.id)}
 						ondragend={handleProjectDragEnd}
 						onclick={() => selectProject(project)}
+						oncontextmenu={(event) => openProjectContextMenu(project, event)}
 						onmouseenter={(e) => showProjectTooltip(project, e)}
 						onmouseleave={hideProjectTooltip}
 					>
@@ -462,6 +539,7 @@
 			</div>
 
 			<footer class="flex flex-col gap-2 py-3 px-2 border-t border-slate-200 dark:border-slate-800">
+				<WorktreeSwitcher collapsed={true} />
 				<ToolsMenu
 					collapsed={true}
 					onRemoteAccess={openRemoteAccessDialog}
@@ -471,6 +549,9 @@
 					onPorts={openPortsDialog}
 					onContainers={openContainersDialog}
 					onMemory={openMemoryDialog}
+					onNotes={openNotesDialog}
+					onWork={() => openWorkDialog()}
+					onDeployments={() => openDeploymentsDialog()}
 				/>
 				<QuickSearchButton collapsed={true} />
 				<SettingButton collapsed={true} onClick={() => openSettingsModal()} />
@@ -564,3 +645,27 @@
 <PortsModal bind:isOpen={quickPanelsState.portsOpen} onClose={closePortsDialog} />
 <ContainersModal bind:isOpen={quickPanelsState.containersOpen} onClose={closeContainersDialog} />
 <MemoryModal bind:isOpen={quickPanelsState.memoryOpen} onClose={closeMemoryDialog} />
+<NotesModal bind:isOpen={quickPanelsState.notesOpen} onClose={closeNotesDialog} />
+<DeploymentsModal
+	bind:isOpen={quickPanelsState.deploymentsOpen}
+	onClose={closeDeploymentsDialog}
+/>
+
+<WorkModal
+	bind:isOpen={quickPanelsState.workOpen}
+	composePullRequest={quickPanelsState.workComposePr}
+	onClose={closeWorkDialog}
+/>
+
+<!-- Project Context Menu -->
+{#if contextMenuProject}
+	<ProjectContextMenu
+		items={contextMenuItems}
+		x={contextMenuX}
+		y={contextMenuY}
+		onSelect={handleContextMenuSelect}
+		onClose={closeProjectContextMenu}
+	/>
+{/if}
+
+<ProjectInfoModal bind:isOpen={showProjectInfo} onClose={closeProjectInfo} project={projectInfoProject} />

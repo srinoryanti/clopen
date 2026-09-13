@@ -6,7 +6,13 @@
 	import type { IconName } from '$shared/types/ui/icons';
 
 	export type GitMoreAction =
+		| 'open-pull-request'
 		| 'merge-branch'
+		| 'rebase-onto'
+		| 'set-upstream'
+		| 'stash-apply'
+		| 'reflog'
+		| 'return-to-branch'
 		| 'push-follow-tags'
 		| 'push-all-tags'
 		| 'push-force-lease'
@@ -61,6 +67,22 @@
 
 	const sections: MenuSection[] = [
 		{
+			// The git panel used to stop at push. This is the one step past it,
+			// and it opens the Issues & PRs surface rather than a composer of its own —
+			// a second place to write a pull request would drift from the first.
+			label: 'Review',
+			items: [
+				{
+					id: 'open-pull-request',
+					label: 'Open pull request…',
+					hint: 'this branch',
+					command: 'Opens the Issues & PRs surface',
+					icon: 'lucide:git-pull-request',
+					needsRemote: true
+				}
+			]
+		},
+		{
 			label: 'Push',
 			items: [
 				{ id: 'push-follow-tags', label: 'Push with tags', hint: '--follow-tags', command: 'git push --follow-tags', icon: 'lucide:tags', needsRemote: true },
@@ -79,7 +101,13 @@
 		{
 			label: 'Branch',
 			items: [
-				{ id: 'merge-branch', label: 'Merge Branch', command: 'git merge', icon: 'lucide:git-merge' }
+				// One entry only: the merge modal already offers default / --no-ff /
+				// --squash, so listing the modes here as well would be two routes to
+				// the same choice.
+				{ id: 'merge-branch', label: 'Merge Branch', command: 'git merge', icon: 'lucide:git-merge' },
+				{ id: 'rebase-onto', label: 'Rebase onto Branch', hint: '--autostash', command: 'git rebase --autostash', icon: 'lucide:git-pull-request-arrow' },
+				{ id: 'return-to-branch', label: 'Return to Previous Branch', hint: 'checkout -', command: 'git checkout -', icon: 'lucide:corner-up-left' },
+				{ id: 'set-upstream', label: 'Branch Upstream…', hint: 'where it pushes', command: 'git branch --set-upstream-to', icon: 'lucide:git-compare-arrows' }
 			]
 		},
 		{
@@ -97,6 +125,13 @@
 				{ id: 'npm-patch', label: 'npm version patch', hint: 'x.x.+1', command: 'npm version patch', icon: 'lucide:package' },
 				{ id: 'npm-minor', label: 'npm version minor', hint: 'x.+1.0', command: 'npm version minor', icon: 'lucide:package' },
 				{ id: 'npm-major', label: 'npm version major', hint: '+1.0.0', command: 'npm version major', icon: 'lucide:package' }
+			]
+		},
+		{
+			label: 'Recovery',
+			items: [
+				{ id: 'stash-apply', label: 'Apply stash (keep entry)', hint: 'apply', command: 'git stash apply', icon: 'lucide:layers' },
+				{ id: 'reflog', label: 'Browse reflog', hint: 'recover commits', command: 'git reflog', icon: 'lucide:history' }
 			]
 		},
 		{
