@@ -36,7 +36,7 @@ import { join } from 'node:path';
 import { messageQueries } from '$backend/database/queries/message-queries';
 import { graphQueries } from '$backend/database/queries/graph-queries';
 import { initializeEngine } from '$backend/engine';
-import { resolveGenerationTarget } from '$backend/engine/resolve-model';
+import { resolveGenerationTarget, GENERATION_SETTINGS } from '$backend/engine/resolve-model';
 import { getClopenDir } from '$backend/utils/paths';
 import { debug } from '$shared/utils/logger';
 import type {
@@ -251,8 +251,6 @@ export interface EpisodicIngestInput {
 	changedPaths: string[];
 	/** Repo-relative paths that no longer exist on disk. */
 	deletedPaths?: string[];
-	/** Path → structural node id, from structural extraction, for `about` edges. */
-	fileNodes: Map<string, string>;
 	/** Memories that were injected into this turn, for adjudication. */
 	injectedMemoryIds?: string[];
 }
@@ -573,7 +571,6 @@ export async function ingestEpisodicMemories(input: EpisodicIngestInput): Promis
 			// recognised as travelling now travels, even though the stored text does
 			// not change.
 			graphQueries.upsert({
-				kind: 'episodic',
 				subkind: duplicate.subkind,
 				scope: duplicate.scope,
 				projectId: duplicate.projectId,
@@ -591,11 +588,14 @@ export async function ingestEpisodicMemories(input: EpisodicIngestInput): Promis
 			// is the one being reinforced.
 			recordContradictions(duplicate.id, opposites, new Set([...candidateIds, ...writtenThisTurn.map(e => e.node.id)]));
 			linkEntities(duplicate.id, memory.entities ?? []);
+			// The paths too: a rephrasing usually names the files better than the
+			// original did, and this is the same "a later reading is a better one"
+			// rule `setPaths` is built on.
+			if (memory.relatedPaths?.length) graphQueries.setPaths(duplicate.id, memory.relatedPaths);
 			continue;
 		}
 
 		const node = graphQueries.upsert({
-			kind: 'episodic',
 			subkind: memory.subkind,
 			scope,
 			projectId,
@@ -619,14 +619,12 @@ export async function ingestEpisodicMemories(input: EpisodicIngestInput): Promis
 		// ── entities ────────────────────────────────────────────────────────
 		linkEntities(node.id, memory.entities ?? []);
 
-		// `about` edges are what make the two halves one graph: from here a question
-		// about the code reaches this memory, and this memory names the code.
-		for (const rawPath of memory.relatedPaths ?? []) {
-			const path = rawPath.replace(/\\/g, '/').replace(/^\.\//, '');
-			const targetId = input.fileNodes.get(path) ?? graphQueries.getByPath(input.projectId, path)?.id;
-			if (!targetId) continue;
-			graphQueries.link({ srcId: node.id, dstId: targetId, rel: 'about', source: 'agent' });
-		}
+		// ── the code this is about ──────────────────────────────────────────
+		// Stored on the memory rather than as an edge to a node standing in for the
+		// file. It is what invalidation ages this memory against, what an anchored
+		// query seeds from, and — through `indexedText` — what makes a pasted path
+		// find what is known about it.
+		graphQueries.setPaths(node.id, memory.relatedPaths ?? []);
 	}
 
 	if (written > 0) {
@@ -681,7 +679,7 @@ async function requestExtraction(model: MemoryModelConfig, prompt: string): Prom
 
 	// The stored providerSlug/accountId can be stale — a model may have moved
 	// provider or the account may be gone (see resolve-model.ts).
-	const target = await resolveGenerationTarget(engine, model.modelId, model.providerSlug);
+	const target = await resolveGenerationTarget(engine, model.modelId, model.providerSlug, GENERATION_SETTINGS.memory);
 	const accountId = model.accountId ?? target.accountId;
 
 	const abortController = new AbortController();

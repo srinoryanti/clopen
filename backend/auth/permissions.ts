@@ -143,6 +143,68 @@ export const ADMIN_ONLY_ROUTES = new Set([
 	'mcp:tools',
 	'mcp:set-tool-overrides',
 	'mcp:call-tool',
+	'mcp:engine-config',
+	// Third-party integrations. A connected account holds a credential and
+	// projects rows onto surfaces every engine and every project can reach, so
+	// the whole surface is admin-only for the same reason MCP is. The read
+	// events are gated too: `integrations:list` names which services this
+	// install is connected to, and `integrations:secrets-health` describes the
+	// state of the key that protects them.
+	'integrations:providers',
+	'integrations:list',
+	'integrations:connect',
+	'integrations:update',
+	'integrations:disconnect',
+	'integrations:health',
+	'integrations:secrets-health',
+	// Account-backed database connections. Linking reads a credential belonging
+	// to the install rather than to the caller, and projects a connection every
+	// admin sees — the same reason the rest of the integrations surface is
+	// admin-only. The ordinary db-client routes stay open: a member still
+	// manages their own hand-typed connections exactly as before.
+	'db-client:providers',
+	'db-client:remote-databases',
+	'db-client:create-options',
+	// Provisions real infrastructure against the account's quota, which is as
+	// outward-facing as anything on this surface gets. Creating an organisation
+	// creates a BILLING entity, which is more so.
+	'db-client:create-group',
+	'db-client:create-database',
+	// Renames a database everyone at the provider sees.
+	'db-client:rename-database',
+	// Destroys a database and everything in it.
+	'db-client:delete-database',
+	'db-client:link',
+	'db-client:update-link',
+	'db-client:unlink',
+	// Applying a migration changes a schema everyone shares, and writing types
+	// writes a file into the repository. The Supabase READS are not listed, so
+	// anyone who can use the connection can look.
+	'db-client:supabase-apply-migration',
+	'db-client:supabase-write-types',
+	// Worktree database branching. Pointing a project at a parent database
+	// commits an account's quota to it, and deleting a branch destroys a real
+	// database — both spend a credential that belongs to the install rather than
+	// to the caller, the same reason `db-client:link` is gated.
+	//
+	// `worktrees:branching-state` and `worktrees:branch-rewrite-env` are
+	// deliberately NOT listed: a member has to be able to see whether their own
+	// worktree got a branch, and to retry the dotenv write when it was refused.
+	//
+	// NEITHER ARE `worktrees:branch-parents` AND `worktrees:branching-save`, and
+	// that is a change rather than an oversight. They used to be here because a
+	// binding could only point at an integration account, and committing the
+	// install's quota is an admin decision. A binding can now point at a DB
+	// Client connection instead — a database the member themselves saved — and
+	// refusing that would make "give this worktree its own database" an
+	// admin-only feature for no reason that survives being stated. The account
+	// half keeps the old rule: `listBranchSources` shows accounts to admins
+	// only, and `requireSource` refuses anything the caller cannot see.
+	'worktrees:branching-clear',
+	'worktrees:branch-orphans',
+	'worktrees:branch-delete',
+	'worktrees:branch-forget',
+	'worktrees:branch-delete-remote',
 	// Memory Graph — the graph is instance-global and is injected into every
 	// future turn on every engine, so editing it changes what every agent is told.
 	// Mutations only: the read surface (memory:graph / :node / :search / :stats /
@@ -166,7 +228,10 @@ export const ADMIN_ONLY_ROUTES = new Set([
 	'memory:retry-failed',
 	// Agent Skills — creating/importing/installing skills writes to the shared
 	// canonical store and applies to every engine, so the whole surface is
-	// admin-only, mirroring MCP and Stack.
+	// admin-only, mirroring MCP and Stack. This now covers what used to be a
+	// separate Commands menu: a `/slash` prompt is a skill with a slash trigger.
+	// `skills:available` is deliberately NOT here — every member needs it to type
+	// a command, and it exposes display fields only.
 	'skills:list',
 	'skills:get',
 	'skills:create',
@@ -177,16 +242,8 @@ export const ADMIN_ONLY_ROUTES = new Set([
 	'skills:delete',
 	'skills:catalog',
 	'skills:install',
-	// Custom Commands — same shared-store rationale as Skills; admin-only surface.
-	'commands:list',
-	'commands:get',
-	'commands:create',
-	'commands:update',
-	'commands:parse-import',
-	'commands:import',
-	'commands:toggle',
-	'commands:delete',
-	'commands:detect',
+	'skills:detect',
+	'skills:adopt',
 	// Subagents — shared canonical store applied to every engine; admin-only.
 	'subagents:list',
 	'subagents:get',
@@ -202,6 +259,21 @@ export const ADMIN_ONLY_ROUTES = new Set([
 	'instructions:save-global',
 	'instructions:get-project',
 	'instructions:save-project',
+	// Project artifacts — reads and in-place edits of a repository's `.agents/`,
+	// `AGENTS.md` block and `.agents/mcp.json` (whose approval lets Clopen start
+	// the processes it declares). Same shared-store rationale; admin-only.
+	'project-artifacts:scan',
+	'project-artifacts:read',
+	'project-artifacts:save-skill',
+	'project-artifacts:delete-skill',
+	'project-artifacts:save-subagent',
+	'project-artifacts:delete-subagent',
+	'project-artifacts:copy-to-agents',
+	'project-artifacts:get-agents-md',
+	'project-artifacts:save-agents-md',
+	'project-artifacts:get-mcp',
+	'project-artifacts:save-mcp',
+	'project-artifacts:approve-mcp',
 	// Permissions — per-engine tool allow/deny applied to every engine/project;
 	// same shared-store rationale as Skills/MCP, admin-only surface.
 	'permissions:list',

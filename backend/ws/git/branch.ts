@@ -6,7 +6,8 @@ import { t } from 'elysia';
 import path from 'node:path';
 import { createRouter } from '$shared/utils/ws-server';
 import { gitService } from '../../git/git-service';
-import { requireProjectAccess } from '../access';
+import { requireProjectWorkspace } from '../access';
+import { identityEnvFor } from './identity-context';
 import { debug } from '$shared/utils/logger';
 
 const BranchSchema = t.Object({
@@ -72,8 +73,8 @@ export const branchHandler = createRouter()
 			nested: t.Optional(t.Array(NestedRepoInfoSchema))
 		})
 	}, async ({ data, conn }) => {
-		const project = requireProjectAccess(conn, data.projectId);
-		return await gitService.getBranches(project.path, data.selectedRemote);
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		return await gitService.getBranches(root, data.selectedRemote);
 	})
 
 	.http('git:create-branch', {
@@ -87,8 +88,8 @@ export const branchHandler = createRouter()
 		}),
 		response: t.Object({ ok: t.Boolean() })
 	}, async ({ data, conn }) => {
-		const project = requireProjectAccess(conn, data.projectId);
-		const cwd = resolveRepoCwd(project.path, data.repoPath);
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
 		await gitService.createBranch(cwd, data.name, data.startPoint);
 		return { ok: true };
 	})
@@ -102,8 +103,8 @@ export const branchHandler = createRouter()
 		}),
 		response: t.Object({ ok: t.Boolean() })
 	}, async ({ data, conn }) => {
-		const project = requireProjectAccess(conn, data.projectId);
-		const cwd = resolveRepoCwd(project.path, data.repoPath);
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
 		await gitService.switchBranch(cwd, data.name);
 		return { ok: true };
 	})
@@ -116,8 +117,8 @@ export const branchHandler = createRouter()
 		}),
 		response: t.Object({ ok: t.Boolean() })
 	}, async ({ data, conn }) => {
-		const project = requireProjectAccess(conn, data.projectId);
-		const cwd = resolveRepoCwd(project.path, data.repoPath);
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
 		await gitService.checkoutCommit(cwd, data.commitHash);
 		return { ok: true };
 	})
@@ -132,8 +133,8 @@ export const branchHandler = createRouter()
 		}),
 		response: t.Object({ ok: t.Boolean() })
 	}, async ({ data, conn }) => {
-		const project = requireProjectAccess(conn, data.projectId);
-		const cwd = resolveRepoCwd(project.path, data.repoPath);
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
 		await gitService.deleteBranch(cwd, data.name, data.force);
 		return { ok: true };
 	})
@@ -147,8 +148,8 @@ export const branchHandler = createRouter()
 		}),
 		response: t.Object({ ok: t.Boolean() })
 	}, async ({ data, conn }) => {
-		const project = requireProjectAccess(conn, data.projectId);
-		const cwd = resolveRepoCwd(project.path, data.repoPath);
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
 		await gitService.renameBranch(cwd, data.oldName, data.newName);
 		return { ok: true };
 	})
@@ -158,6 +159,10 @@ export const branchHandler = createRouter()
 			projectId: t.String(),
 			branchName: t.String(),
 			noFastForward: t.Optional(t.Boolean()),
+			/** Collapse the branch into staged changes without committing. */
+			squash: t.Optional(t.Boolean()),
+			/** Refuse the merge unless it is a fast-forward. */
+			ffOnly: t.Optional(t.Boolean()),
 			repoPath: t.Optional(t.String())
 		}),
 		response: t.Object({
@@ -165,7 +170,55 @@ export const branchHandler = createRouter()
 			message: t.String()
 		})
 	}, async ({ data, conn }) => {
-		const project = requireProjectAccess(conn, data.projectId);
-		const cwd = resolveRepoCwd(project.path, data.repoPath);
-		return await gitService.mergeBranch(cwd, data.branchName, data.noFastForward ?? false);
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
+		return await gitService.mergeBranch(
+			cwd,
+			data.branchName,
+			{
+				noFastForward: data.noFastForward ?? false,
+				squash: data.squash ?? false,
+				ffOnly: data.ffOnly ?? false
+			},
+			identityEnvFor(conn, data.projectId)
+		);
+	})
+
+	.http('git:rebase', {
+		data: t.Object({
+			projectId: t.String(),
+			upstream: t.String({ minLength: 1 }),
+			/** Stash and restore local changes around the rebase. Defaults to true. */
+			autostash: t.Optional(t.Boolean()),
+			repoPath: t.Optional(t.String())
+		}),
+		response: t.Object({
+			success: t.Boolean(),
+			hasConflicts: t.Boolean(),
+			message: t.String()
+		})
+	}, async ({ data, conn }) => {
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
+		return await gitService.rebaseOnto(
+			cwd,
+			data.upstream,
+			data.autostash ?? true,
+			identityEnvFor(conn, data.projectId)
+		);
+	})
+
+	.http('git:return-to-branch', {
+		data: t.Object({
+			projectId: t.String(),
+			/** Explicit target; omit to use git's own "previous checkout" shorthand. */
+			branch: t.Optional(t.String()),
+			repoPath: t.Optional(t.String())
+		}),
+		response: t.Object({ ok: t.Boolean() })
+	}, async ({ data, conn }) => {
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
+		await gitService.returnToBranch(cwd, data.branch);
+		return { ok: true };
 	});

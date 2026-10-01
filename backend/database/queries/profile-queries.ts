@@ -2,7 +2,7 @@
  * Profile Queries
  *
  * CRUD for reusable Profiles (Settings → Profiles) — named bundles that
- * reference existing artifacts (Skills, Commands, Subagents, MCP Connectors) by
+ * reference existing artifacts (Skills, Commands, Subagents, Integrations) by
  * their stable slug. The `profiles` table holds only the bundle metadata; the
  * `profile_items` table holds the (artifact_type, ref) references. Neither
  * duplicates artifact data — see migration 050.
@@ -14,10 +14,12 @@
 import { getDatabase } from '../index';
 
 /** Artifact kinds a profile can bundle. Permissions are handled separately
- *  (they are a per-engine allow/deny overlay, not a slug-referenced artifact). */
-export type ProfileItemType = 'skill' | 'command' | 'subagent' | 'mcp';
+ *  (they are a per-engine allow/deny overlay, not a slug-referenced artifact).
+ *  `'command'` is gone since migration 079 folded Commands into Skills — the
+ *  migration re-typed existing `command` rows to `skill` under their new slug. */
+export type ProfileItemType = 'skill' | 'subagent' | 'mcp';
 
-export const PROFILE_ITEM_TYPES: ProfileItemType[] = ['skill', 'command', 'subagent', 'mcp'];
+export const PROFILE_ITEM_TYPES: ProfileItemType[] = ['skill', 'subagent', 'mcp'];
 
 export interface ProfileRow {
 	id: number;

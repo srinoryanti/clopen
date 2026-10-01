@@ -16,6 +16,22 @@ if (typeof globalThis.Bun === 'undefined') {
 // MUST be first import — cleans process.env before any other module reads it.
 import { SERVER_ENV } from './utils/env';
 
+// Git's credential/askpass helpers re-invoke Clopen through whatever entry point
+// is running, which is `Bun.main` — and that is this file under `bun --watch
+// backend/index.ts`, and `scripts/start.ts` (which imports this one) under `bun
+// run start`. `bin/clopen.ts` has the same guard for a global install. All three
+// need it: without one, git would spawn an entry that does not know the
+// subcommand, and an HTTPS push would fail asking for a password nobody typed.
+//
+// Placed here, above every side-effecting import, so a helper invocation exits
+// before anything opens a port or starts a watcher.
+import { runGitHelper } from './git/identity/cli';
+
+{
+	const helperExit = await runGitHelper(process.argv.slice(2));
+	if (helperExit !== null) process.exit(helperExit);
+}
+
 import { Elysia } from 'elysia';
 import { corsMiddleware } from './middleware/cors';
 import { errorHandlerMiddleware } from './middleware/error-handler';
@@ -45,18 +61,24 @@ import { wsRouter } from './ws';
 // binary transfers with `write EPIPE`. See backend/http/files-upload.ts.
 import { filesUploadRoute } from './http/files-upload';
 import { filesDownloadRoute } from './http/files-download';
+import { filesSharedRoute } from './http/files-shared';
 
 // HTTP routes for per-user notification sounds (upload / serve / delete).
 import { audioRoute } from './http/audio';
 
+// HTTP routes for Web Push subscriptions + test (mobile background notifications).
+import { pushRoute } from './http/push';
+
 // HTTP routes for SFTP transfer — same reason as the file upload route above.
 import { sshSftpRoute } from './http/ssh-sftp';
+import { notesImagesRoute } from './http/notes-images';
+import { integrationHooksRoute } from './http/integration-hooks';
 
 // Import browser preview manager for graceful shutdown
 import { browserPreviewServiceManager } from './preview';
 
 // MCP remote server for Open Code custom tools
-import { handleMcpRequest, handleExternalMcpRequest, closeMcpServer, completeAuthorization } from './mcp';
+import { handleMcpRequest, handleExternalMcpRequest, handleProjectMcpRequest, closeMcpServer, completeAuthorization } from './mcp';
 
 // Auth middleware
 import { checkRouteAccess, PUBLIC_ROUTES } from './auth/permissions';
@@ -67,6 +89,7 @@ import { sessionCleanupScheduler } from './auth/session-cleanup';
 import { portMonitor } from './ports/monitor';
 import { containerMonitor } from './containers/monitor';
 import { stopAllLogStreams as stopAllContainerLogStreams } from './containers/logs';
+import { stopAllBuildLogStreams } from './deployments/log-streams';
 import { uploadTempCleanup } from './http/upload-temp-cleanup';
 import { ws as wsServer } from './utils/ws';
 import { messageRateLimiter } from './ws/message-rate-limiter';
@@ -104,8 +127,8 @@ wsRouter.setAuthMiddleware(async (conn, action) => {
 });
 
 // Register message rate limiter on WebSocket router — prevents DoS via message spam
-wsRouter.setRateLimiter((conn, action) => {
-	return messageRateLimiter.checkRateLimit(conn, action);
+wsRouter.setRateLimiter((conn, action, isRequest) => {
+	return messageRateLimiter.checkRateLimit(conn, action, isRequest);
 });
 
 /**
@@ -165,6 +188,16 @@ const app = new Elysia()
 		return handleExternalMcpRequest(request, params.slug);
 	})
 
+	// Per-project proxy for servers a repository declares in `.agents/mcp.json`.
+	// Only served while an admin has approved the file's current content — see
+	// backend/mcp/external/project.ts.
+	.all('/mcp/proj/:projectId/:name', async ({ request, params, server }) => {
+		server?.timeout(request, 0);
+		let name = params.name;
+		try { name = decodeURIComponent(name); } catch { /* already decoded */ }
+		return handleProjectMcpRequest(request, params.projectId, name);
+	})
+
 	// Stable OAuth redirect target for centralized MCP sign-in. The browser is
 	// redirected here after the user consents; we exchange the code for tokens
 	// (stored against the server) and show a self-closing confirmation page. The
@@ -191,12 +224,23 @@ const app = new Elysia()
 	// on the HTTP path through the Vite dev proxy.
 	.use(filesUploadRoute)
 	.use(filesDownloadRoute)
+	.use(filesSharedRoute)
 
 	// Per-user notification sound upload/serve/delete.
 	.use(audioRoute)
 
+	// Web Push subscriptions + test (mobile background notifications).
+	.use(pushRoute)
+
 	// SSH file transfer (SFTP download/upload).
 	.use(sshSftpRoute)
+
+	// Notes images
+	.use(notesImagesRoute)
+
+	// Inbound third-party events. Unauthenticated by necessity — it verifies a
+	// per-provider signature over the raw bytes instead of a session.
+	.use(integrationHooksRoute)
 
 	// Mount WebSocket router (all functionality now via WebSocket)
 	.use(wsRouter.asPlugin('/ws'));
@@ -333,6 +377,11 @@ async function gracefulShutdown() {
 		// and browser teardown below — otherwise the old process keeps those
 		// sockets open long enough to overlap the new process ("too many clients").
 		await connectionManager.closeAll();
+		// Engines next, because they own CHILD PROCESSES. Everything below is
+		// in-process cleanup that dies with us anyway, but an `opencode serve`
+		// we fail to kill outlives the restart holding its port and data-dir
+		// lock — and the 5s force-exit above used to fire before we got here.
+		await disposeAllEngines();
 		// Same reasoning for SSH: stop the forwards' listeners and close every
 		// transport so their remote sessions and bound ports are released now.
 		await sshForwardManager.stopAll();
@@ -348,6 +397,9 @@ async function gracefulShutdown() {
 		// Same for the container list, and the log streams it may still be pumping
 		stopAllContainerLogStreams();
 		containerMonitor.stop();
+		// Build-log follows are open HTTPS responses against a provider; nothing
+		// closes them but us.
+		stopAllBuildLogStreams();
 		// Close MCP remote server (before engines, as they may still reference it)
 		await closeMcpServer();
 		// Cleanup browser preview sessions
@@ -359,8 +411,6 @@ async function gracefulShutdown() {
 		stopMemoryMaintenance();
 		stopExtractionRunner();
 		await flushEpisodicIngest();
-		// Dispose all AI engines
-		await disposeAllEngines();
 		// Close database connection
 		closeDatabase();
 		debug.log('server', '✅ Graceful shutdown completed');

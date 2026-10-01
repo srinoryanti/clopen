@@ -23,6 +23,9 @@
  * a file change, made clients reload every few seconds with nothing actually
  * changing. So on Linux we walk the tree ourselves and never watch an ignored
  * directory, which removes the overwhelming majority of the watch descriptors.
+ *
+ * What counts as ignored — by name, by manifest, by signature — lives in
+ * `watch-ignore.ts`.
  */
 
 /** Whether the platform's recursive `fs.watch` is a single cheap OS handle. */
@@ -30,11 +33,25 @@ const USE_NATIVE_RECURSIVE_WATCH = process.platform !== 'linux';
 
 import { watch, type FSWatcher, existsSync } from 'node:fs';
 import { stat, readdir } from 'node:fs/promises';
-import { join, relative, normalize, sep } from 'node:path';
+import { basename, dirname, join, relative, normalize, sep } from 'node:path';
 import { ws } from '$backend/utils/ws';
 import { debug } from '$shared/utils/logger';
+import { isScopeOfProject, scopeProjectId } from '$shared/utils/workspace-scope';
 import { resolveGitDirs, type GitDirTarget } from '$backend/git/git-dirs';
+import {
+	beginWatchedDiscovery,
+	endWatchedDiscovery,
+	invalidateRepoSet,
+	notifyPathChanged
+} from '$backend/git/nested-repos';
 import type { FileChange } from '$shared/types/filesystem';
+import {
+	GeneratedDirClassifier,
+	isIgnoredPath,
+	isMarkableDirName,
+	isOutputMarker,
+	isSignatureEntry
+} from './watch-ignore';
 
 /**
  * Debounce configuration
@@ -55,39 +72,6 @@ const RESTART_DELAYS_MS = [1000, 2000, 4000, 8000];
 
 /** How long a rebuilt watcher must survive before its fault count is forgiven. */
 const FAULT_FORGIVENESS_MS = 60_000;
-
-/**
- * Directories to ignore when watching
- */
-const IGNORED_DIRS = new Set([
-	'node_modules',
-	'.git',
-	'.svelte-kit',
-	'dist',
-	'build',
-	'.next',
-	'.nuxt',
-	'.output',
-	'__pycache__',
-	'.pytest_cache',
-	'coverage',
-	'.nyc_output',
-	'.turbo',
-	'.cache',
-	'.temp',
-	'.tmp',
-	'vendor'
-]);
-
-/**
- * Files to ignore
- */
-const IGNORED_FILES = new Set([
-	'.DS_Store',
-	'Thumbs.db',
-	'.gitkeep',
-	'.gitignore~'
-]);
 
 /**
  * Entries inside a git directory that never change what the Git panel renders.
@@ -178,6 +162,8 @@ interface ProjectWatcher {
 	faults: number;
 	/** Flipped by stopWatching so in-flight async tree walks bail out. */
 	closed: boolean;
+	/** Cached "is this directory generated output" decisions (see watch-ignore). */
+	generated: GeneratedDirClassifier;
 	/**
 	 * Every known git directory -> the working tree it belongs to. Covers the
 	 * project's own repo and each sub-repo, and is the attribution table for
@@ -221,15 +207,25 @@ class FileWatcherManager {
 
 	/**
 	 * Per-project dirty file tracking for snapshot system.
-	 * Accumulates changed file relative paths between snapshot captures.
+	 * Accumulates changed file relative paths between snapshot captures, with
+	 * the time of each path's latest event.
 	 */
-	private dirtyFiles = new Map<string, Set<string>>();
+	private dirtyFiles = new Map<string, Map<string, number>>();
 
 	/**
 	 * Get dirty files accumulated since last clear for a project.
 	 */
 	getDirtyFiles(projectId: string): Set<string> {
-		return this.dirtyFiles.get(projectId) || new Set();
+		return new Set(this.dirtyFiles.get(projectId)?.keys() ?? []);
+	}
+
+	/**
+	 * When the watcher last saw a path change (epoch ms), or undefined when it
+	 * saw nothing — the only record of WHEN a file was deleted, since a deleted
+	 * file has no mtime left to read.
+	 */
+	getLastChangeAt(projectId: string, relativePath: string): number | undefined {
+		return this.dirtyFiles.get(projectId)?.get(relativePath);
 	}
 
 	/**
@@ -244,9 +240,9 @@ class FileWatcherManager {
 	 */
 	private trackDirtyFile(projectId: string, relativePath: string): void {
 		if (!this.dirtyFiles.has(projectId)) {
-			this.dirtyFiles.set(projectId, new Set());
+			this.dirtyFiles.set(projectId, new Map());
 		}
-		this.dirtyFiles.get(projectId)!.add(relativePath);
+		this.dirtyFiles.get(projectId)!.set(relativePath, Date.now());
 	}
 
 	/**
@@ -340,6 +336,7 @@ class FileWatcherManager {
 				truncated: false,
 				faults,
 				closed: false,
+				generated: new GeneratedDirClassifier(normalizedPath),
 				gitDirOwners: new Map(),
 				gitWatchers: new Map(),
 				rejectedGitDirs: new Set(),
@@ -349,6 +346,12 @@ class FileWatcherManager {
 				gitTargetsTimer: null
 			};
 			this.watchers.set(projectId, projectWatcher);
+
+			// From here on this watcher is the authority on when the project's
+			// sub-repo set and their working states change, so discovery can stop
+			// re-deriving them on a short clock. Paired with `endWatchedDiscovery`
+			// in `stopWatching`, which puts discovery back on the clock.
+			beginWatchedDiscovery(normalizedPath);
 
 			// Watch the root synchronously so events are never missed while the
 			// (async) subtree walk is still in progress.
@@ -401,7 +404,7 @@ class FileWatcherManager {
 					'file',
 					`Watch ceiling (${MAX_WATCHED_DIRS} dirs) reached for project ${pw.projectId}; deeper directories will not report changes`
 				);
-				ws.emit.project(pw.projectId, 'files:watch-error', {
+				ws.emit.project(scopeProjectId(pw.projectId), 'files:watch-error', {
 					projectId: pw.projectId,
 					error: `Project is too large to watch entirely (${MAX_WATCHED_DIRS}+ directories). Changes in deeply nested folders may not appear automatically.`
 				});
@@ -472,8 +475,15 @@ class FileWatcherManager {
 	 * Recursively attach watchers to every non-ignored directory under `dir`.
 	 * Ignored directories (node_modules, .git, build output, …) are never
 	 * descended into — that pruning is what keeps the watch count survivable.
+	 *
+	 * `announceGitDirs` reports each pruned `.git` to git discovery. Set it when
+	 * walking a directory that just APPEARED: everything inside it was created
+	 * before this watcher had a handle on it, so a `git clone` or `git init` into
+	 * a fresh nested path emits no event we can ever see. Pruning `.git` without
+	 * announcing it therefore lost the sub-repo for the whole session. The
+	 * initial walk leaves it off — `syncGitWatchers` already resolves the tree.
 	 */
-	private async watchSubtree(pw: ProjectWatcher, dir: string): Promise<void> {
+	private async watchSubtree(pw: ProjectWatcher, dir: string, announceGitDirs = false): Promise<void> {
 		if (pw.closed) return;
 
 		let entries;
@@ -482,6 +492,7 @@ class FileWatcherManager {
 		} catch {
 			return; // Directory vanished or is unreadable — nothing to watch.
 		}
+		const names = entries.map((entry) => entry.name);
 
 		for (const entry of entries) {
 			if (pw.closed) return;
@@ -489,7 +500,16 @@ class FileWatcherManager {
 
 			const childPath = join(dir, entry.name);
 			const relativePath = relative(pw.projectPath, childPath).replace(/\\/g, '/');
-			if (this.shouldIgnore(relativePath)) continue;
+			if (isIgnoredPath(relativePath)) {
+				if (announceGitDirs && entry.name === '.git') {
+					this.routeGitEvent(pw, relativePath, childPath);
+				}
+				continue;
+			}
+			// Output that is only recognisable by its manifest or its own contents
+			// (`target/` beside `Cargo.toml`, a virtualenv under any name).
+			if (await pw.generated.isGenerated(childPath, names)) continue;
+			if (pw.closed) return;
 
 			if (!this.watchDir(pw, childPath)) {
 				// Ceiling reached — stop descending entirely rather than watching an
@@ -497,7 +517,7 @@ class FileWatcherManager {
 				if (pw.truncated) return;
 				continue;
 			}
-			await this.watchSubtree(pw, childPath);
+			await this.watchSubtree(pw, childPath, announceGitDirs);
 		}
 	}
 
@@ -531,6 +551,9 @@ class FileWatcherManager {
 			}
 			projectWatcher.gitDirOwners.clear();
 
+			// No more signals from here, so discovery must not keep trusting them.
+			endWatchedDiscovery(projectWatcher.projectPath);
+
 			// Clear debounce timers
 			if (projectWatcher.debounceTimer) {
 				clearTimeout(projectWatcher.debounceTimer);
@@ -562,6 +585,17 @@ class FileWatcherManager {
 		this.viewers.delete(projectId);
 		this.restarting.delete(projectId);
 		this.stopWatching(projectId);
+	}
+
+	/**
+	 * Release every workspace of a project — the main tree and each worktree.
+	 * Watchers are keyed per workspace, so releasing the project id alone would
+	 * leave a deleted project's worktree watchers running.
+	 */
+	releaseProjectScopes(projectId: string): void {
+		for (const key of [...this.watchers.keys(), ...this.viewers.keys()]) {
+			if (isScopeOfProject(key, projectId)) this.releaseProject(key);
+		}
 	}
 
 	/**
@@ -602,13 +636,29 @@ class FileWatcherManager {
 		if (relativePath.startsWith('..')) return;
 
 		// Git metadata is not a working-tree change — it drives the Git panel
-		// instead. This runs BEFORE `shouldIgnore`, which discards every `.git`
+		// instead. This runs BEFORE `isIgnoredPath`, which discards every `.git`
 		// path: where the root watch is recursive it is the only thing that sees
 		// a sub-repo's git dir, so dropping it here is what left a commit made
 		// inside a nested repo completely unreported.
+		// Tell sub-repo discovery before anything below filters the path away.
+		// It decides for itself what a path means: `routeGitEvent` swallows every
+		// `.git` path, so `.git/info/exclude` — which moves the reported repo set
+		// just like `.gitignore` — would otherwise never reach it.
+		notifyPathChanged(projectWatcher.projectPath, fullPath);
+
 		if (this.routeGitEvent(projectWatcher, relativePath, fullPath)) return;
 
-		if (this.shouldIgnore(relativePath)) return;
+		if (isIgnoredPath(relativePath)) return;
+
+		// A signature or manifest appearing or vanishing changes what counts as
+		// generated, so re-decide before judging this very event by it.
+		const entryName = basename(fullPath);
+		if (isSignatureEntry(entryName) || isOutputMarker(entryName)) {
+			this.reclassify(projectWatcher, entryName, dirname(fullPath));
+		}
+
+		if (await projectWatcher.generated.isInsideGenerated(relativePath)) return;
+		if (projectWatcher.closed) return;
 
 		// Determine change type
 		let changeType: 'created' | 'modified' | 'deleted';
@@ -631,13 +681,16 @@ class FileWatcherManager {
 		// descendants' watchers so they can't leak.
 		if (!USE_NATIVE_RECURSIVE_WATCH) {
 			if (isDirectory && changeType === 'created') {
-				if (this.watchDir(projectWatcher, fullPath)) {
-					void this.watchSubtree(projectWatcher, fullPath);
+				if (!(await projectWatcher.generated.isGenerated(fullPath)) && this.watchDir(projectWatcher, fullPath)) {
+					// Announce pruned git dirs: this subtree existed before we could
+					// watch it, so anything already inside it emitted no event.
+					void this.watchSubtree(projectWatcher, fullPath, true);
 				}
 			} else if (changeType === 'deleted' && projectWatcher.dirWatchers.has(fullPath)) {
 				this.unwatchDir(projectWatcher, fullPath);
 			}
 		}
+		if (changeType === 'deleted') projectWatcher.generated.forgetTree(fullPath);
 
 		// Track dirty file for snapshot system
 		this.trackDirtyFile(projectId, relativePath);
@@ -663,25 +716,51 @@ class FileWatcherManager {
 	}
 
 	/**
-	 * Check if a file/directory should be ignored
+	 * Re-decide the directories a signature or manifest describes: its parent
+	 * for a signature (`CACHEDIR.TAG`, `pyvenv.cfg`), the output-named siblings
+	 * for a manifest (`Cargo.toml` → `target/`). The cached decisions are dropped
+	 * synchronously so the triggering event is already judged by the new state.
+	 *
+	 * Where recursion is emulated the watch set follows: a directory that just
+	 * became generated releases its handles, and one that stopped being generated
+	 * (its manifest was deleted) is walked and watched like a new directory.
 	 */
-	private shouldIgnore(filename: string): boolean {
-		const parts = filename.split('/');
+	private reclassify(pw: ProjectWatcher, entryName: string, parentDir: string): void {
+		const signature = isSignatureEntry(entryName);
+		if (signature) pw.generated.forget(parentDir);
+		const manifest = isOutputMarker(entryName);
+		if (manifest) pw.generated.forgetMarkableChildren(parentDir);
+		if (USE_NATIVE_RECURSIVE_WATCH) return;
 
-		// Check each path segment
-		for (const part of parts) {
-			if (IGNORED_DIRS.has(part) || IGNORED_FILES.has(part)) {
-				return true;
+		void (async () => {
+			const dirs: string[] = signature ? [parentDir] : [];
+			if (manifest) {
+				try {
+					const entries = await readdir(parentDir, { withFileTypes: true });
+					for (const entry of entries) {
+						if (entry.isDirectory() && isMarkableDirName(entry.name)) dirs.push(join(parentDir, entry.name));
+					}
+				} catch {
+					// The directory went away; its own deletion event cleans up.
+				}
 			}
-			// Ignore hidden files and directories (except .env files)
-			if (part.startsWith('.') && !part.startsWith('.env')) {
-				return true;
-			}
-		}
-
-		return false;
+			for (const dir of dirs) await this.syncWatchState(pw, dir);
+		})();
 	}
 
+	/** Linux only: make `dir`'s watch match its current generated decision. */
+	private async syncWatchState(pw: ProjectWatcher, dir: string): Promise<void> {
+		if (dir === pw.projectPath) return;
+		const generated = await pw.generated.isGenerated(dir);
+		if (pw.closed) return;
+		if (generated) {
+			if (pw.dirWatchers.has(dir)) this.unwatchDir(pw, dir);
+			return;
+		}
+		const relativePath = relative(pw.projectPath, dir).replace(/\\/g, '/');
+		if (pw.dirWatchers.has(dir) || !pw.dirWatchers.has(dirname(dir)) || isIgnoredPath(relativePath)) return;
+		if (this.watchDir(pw, dir)) void this.watchSubtree(pw, dir, true);
+	}
 
 	/**
 	 * Flush pending changes to clients
@@ -698,7 +777,7 @@ class FileWatcherManager {
 		projectWatcher.debounceTimer = null;
 
 		// Emit changes to users currently viewing the project
-		ws.emit.project(projectId, 'files:changed', {
+		ws.emit.project(scopeProjectId(projectId), 'files:changed', {
 			projectId,
 			changes,
 			timestamp: Date.now()
@@ -790,7 +869,17 @@ class FileWatcherManager {
 			try {
 				const watcher = watch(dirToWatch, { recursive }, (_eventType, filename) => {
 					if (!filename) return;
-					const entryPath = relative(gitDirPath, join(dirToWatch, String(filename)));
+					const fullPath = join(dirToWatch, String(filename));
+
+					// These handles are their own event source: nothing here reaches
+					// `handleFileChange`, and on Linux — where `.git` is pruned from the
+					// recursive walk — they are the ONLY source for it. Discovery has to
+					// be told from here too, before `isGitStateEvent` filters, since that
+					// filter answers 'does the panel show this' and drops `info/exclude`,
+					// which discovery very much cares about.
+					notifyPathChanged(projectWatcher.projectPath, fullPath);
+
+					const entryPath = relative(gitDirPath, fullPath);
 					if (!isGitStateEvent(entryPath)) return;
 					this.emitGitChanged(projectWatcher.projectId, repoPath);
 				});
@@ -832,6 +921,14 @@ class FileWatcherManager {
 	 * Queue a re-resolve of the project's git directories, for when an event
 	 * arrives from a `.git` we do not know about — `git init` or `git clone` run
 	 * inside the project while it is open.
+	 *
+	 * This is the one signal that the project's repo SET changed, so it drops
+	 * the cached sub-repo walk first. Without that, `resolveGitDirs` answers
+	 * from a walk taken before the new repo existed, the git dir stays
+	 * unaccounted for, and `syncGitWatchers` files it under `rejectedGitDirs` —
+	 * which is permanent, and which `routeGitEvent` then uses to stop
+	 * scheduling refreshes for it. A repo created in an open project would
+	 * never be watched again.
 	 */
 	private scheduleGitTargetsRefresh(projectId: string, gitDirPath?: string): void {
 		const projectWatcher = this.watchers.get(projectId);
@@ -843,6 +940,7 @@ class FileWatcherManager {
 		projectWatcher.gitTargetsTimer = setTimeout(() => {
 			projectWatcher.gitTargetsTimer = null;
 			if (projectWatcher.closed) return;
+			invalidateRepoSet(projectWatcher.projectPath);
 			void this.syncGitWatchers(projectId).then(() => {
 				if (projectWatcher.closed) return;
 				// The repo set itself changed, so tell clients: this is what flips a
@@ -894,7 +992,7 @@ class FileWatcherManager {
 			projectWatcher.gitDebounceTimer = null;
 			const repoPaths = Array.from(projectWatcher.pendingGitRepos);
 			projectWatcher.pendingGitRepos.clear();
-			ws.emit.project(projectId, 'git:changed', {
+			ws.emit.project(scopeProjectId(projectId), 'git:changed', {
 				projectId,
 				repoPaths,
 				timestamp: Date.now()
@@ -931,10 +1029,14 @@ class FileWatcherManager {
 				'file',
 				`Watcher for project ${projectId} faulted ${attempt} times; giving up on automatic restart`
 			);
-			ws.emit.project(projectId, 'files:watch-error', {
+			ws.emit.project(scopeProjectId(projectId), 'files:watch-error', {
 				projectId,
 				error: 'File watching stopped after repeated failures. Refresh to retry.'
 			});
+			// No more signals are coming, so sub-repo discovery must stop trusting
+			// this watcher and go back to re-deriving on its own clock. Without
+			// this the claim outlives the watcher that made it.
+			this.stopWatching(projectId);
 			return;
 		}
 
@@ -959,7 +1061,7 @@ class FileWatcherManager {
 			// reconcile — deliberately NOT via `files:changed`, which means "these
 			// specific paths changed" and made consumers tear down and rebuild live
 			// views (the open diff editor) on every restart.
-			ws.emit.project(projectId, 'files:resync', {
+			ws.emit.project(scopeProjectId(projectId), 'files:resync', {
 				projectId,
 				timestamp: Date.now()
 			});

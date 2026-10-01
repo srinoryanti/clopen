@@ -6,6 +6,9 @@
 	import { clickOutside } from '$frontend/utils/click-outside';
 	import { settings } from '$frontend/stores/features/settings.svelte';
 	import { projectState } from '$frontend/stores/core/projects.svelte';
+	import { gitIdentityStore } from '$frontend/stores/features/git-identity.svelte';
+	import GitIdentityPicker from './GitIdentityPicker.svelte';
+	import { currentScopeKey } from '$frontend/stores/features/worktrees.svelte';
 	import { showError } from '$frontend/stores/ui/notification.svelte';
 	import {
 		gitDraft,
@@ -16,7 +19,7 @@
 		setGitOp
 	} from '$frontend/stores/features/git-workspace.svelte';
 	import ws from '$frontend/utils/ws';
-	import { resolveGenerationModel } from '$frontend/utils/model-override';
+	import { resolveGenerationModel, GENERATION_TIMEOUT_MS } from '$frontend/utils/model-override';
 	import GitMoreMenu, { type GitMoreAction } from '$frontend/components/git/GitMoreMenu.svelte';
 
 	interface Props {
@@ -33,6 +36,12 @@
 		isMoreBusy?: boolean;
 		/** Repo is detached / mid-operation (rebase, merge, …) — block branch-targeted actions */
 		repoBusy?: boolean;
+		/**
+		 * Where a push will actually land, e.g. `contributor/clopen/their-branch`.
+		 * Shown in the tooltip because the destination is decided by the branch's
+		 * own config, not by the panel's remote dropdown.
+		 */
+		pushDestination?: string;
 		/** Human-readable reason shown in disabled button tooltips */
 		repoBusyReason?: string;
 		/** Absolute path to a nested repo; when set, actions operate inside that repo. */
@@ -62,6 +71,7 @@
 		isMoreBusy = false,
 		repoBusy = false,
 		repoBusyReason = '',
+		pushDestination = '',
 		repoPath,
 		onCreateBranch,
 		onPush,
@@ -77,18 +87,44 @@
 
 	const showSyncActions = $derived(Boolean(onPush || onPull));
 
+	// Push, pull and the More menu all move refs in the same repo, so running two
+	// at once is how you get `index.lock` errors and half-applied state. One in
+	// flight disables the others — the same reason each disables itself.
+	const syncBusy = $derived(isPushing || isPulling || isMoreBusy);
+
 	// Branch operand shown in the sync-button tooltips (omitted when unknown).
-	const branchRef = $derived(currentBranch ? ` ${currentBranch}` : '');
 
 	// The commit message draft is per-project and lives in the git workspace
 	// store so it survives remounts and is isolated/restored per project.
 	let textareaEl = $state<HTMLTextAreaElement | null>(null);
 
-	// Busy flags live in the per-project store so a generation started for one
-	// project keeps its spinner (and clears the right project's flag) even after
-	// the user switches projects mid-run.
+	// Busy flags live in the shared git-op store so a generation started for one
+	// workspace keeps its spinner (and clears the right flag) even after the user
+	// switches away mid-run. The key is the workspace scope, not the bare project
+	// id — a worktree is its own checkout, and keying by project made its spinner
+	// show up on the main tree's form as well.
 	const activeProjectId = $derived(projectState.currentProject?.id ?? '');
-	const ops = $derived(getGitOps(activeProjectId, repoPath));
+	/**
+	 * Who the next commit is attributed to.
+	 *
+	 * Read from the store rather than fetched into local state so every surface
+	 * showing it (this line, Settings) reflects one answer. The fetch below is
+	 * keyed on the project, so switching projects replaces the line instead of
+	 * leaving the previous project's author on screen.
+	 */
+	const resolvedIdentity = $derived(gitIdentityStore.resolvedFor(activeProjectId));
+
+	$effect(() => {
+		const projectId = activeProjectId;
+		if (!projectId) return;
+		// Only fetch when this project has no answer yet: the store is the cache,
+		// and re-fetching on every render would put a request behind every
+		// keystroke in the message box.
+		if (gitIdentityStore.resolvedFor(projectId)) return;
+		void gitIdentityStore.fetchResolved(projectId);
+	});
+	const opScope = $derived(currentScopeKey() || activeProjectId);
+	const ops = $derived(getGitOps(opScope, repoPath));
 	const isGenerating = $derived(ops.isGenerating);
 
 	// Local commit message for nested repos so each submodule keeps its own draft.
@@ -226,9 +262,10 @@
 
 	async function generateCommitMessage() {
 		const projectId = projectState.currentProject?.id;
+		const scope = opScope;
 		if (!projectId || stagedCount === 0 || isGenerating) return;
 
-		setGitOp(projectId, 'isGenerating', true, repoPath);
+		setGitOp(scope, 'isGenerating', true, repoPath);
 		try {
 			const { format } = settings.commitGenerator;
 			const { engine: resolvedEngine, providerSlug: resolvedProvider, modelId: resolvedModel } =
@@ -242,7 +279,7 @@
 				format,
 				...(repoPath && { repoPath }),
 				...(extra && { customPrompt: extra })
-			});
+			}, GENERATION_TIMEOUT_MS);
 			// Route the result to the project it was generated for — only touches
 			// the live commit box if that project is still active.
 			if (repoPath) {
@@ -256,15 +293,16 @@
 		} catch (err) {
 			showError('Generate Failed', err instanceof Error ? err.message : 'Failed to generate commit message');
 		} finally {
-			setGitOp(projectId, 'isGenerating', false, repoPath);
+			setGitOp(scope, 'isGenerating', false, repoPath);
 		}
 	}
 
 	async function generateBranchName() {
 		const projectId = projectState.currentProject?.id;
+		const scope = opScope;
 		if (!projectId || stagedCount === 0 || isGeneratingBranch || repoBusy) return;
 
-		setGitOp(projectId, 'isGeneratingBranch', true, repoPath);
+		setGitOp(scope, 'isGeneratingBranch', true, repoPath);
 		try {
 			const { branchSeparator, branchConfig } = settings.commitGenerator;
 			const { engine: resolvedEngine, providerSlug: resolvedProvider, modelId: resolvedModel } =
@@ -279,21 +317,22 @@
 				maxWords: branchConfig?.maxWords ?? 3,
 				...(repoPath && { repoPath }),
 				...(extra && { customPrompt: extra })
-			});
+			}, GENERATION_TIMEOUT_MS);
 			updateBranchDraft(result.branchName);
 			updateBranchDraftVisible(true);
 		} catch (err) {
 			showError('Generate Branch Failed', err instanceof Error ? err.message : 'Failed to generate branch name');
 		} finally {
-			setGitOp(projectId, 'isGeneratingBranch', false, repoPath);
+			setGitOp(scope, 'isGeneratingBranch', false, repoPath);
 		}
 	}
 
 	async function createGeneratedBranch() {
 		const projectId = projectState.currentProject?.id;
+		const scope = opScope;
 		if (!projectId || !onCreateBranch || !branchNameDraft.trim() || isCreatingBranch) return;
 
-		setGitOp(projectId, 'isCreatingBranch', true, repoPath);
+		setGitOp(scope, 'isCreatingBranch', true, repoPath);
 		try {
 			const created = await onCreateBranch(branchNameDraft.trim());
 			if (created !== false) {
@@ -301,13 +340,22 @@
 				updateBranchDraftVisible(false);
 			}
 		} finally {
-			setGitOp(projectId, 'isCreatingBranch', false, repoPath);
+			setGitOp(scope, 'isCreatingBranch', false, repoPath);
 		}
 	}
 </script>
 
 <div class="px-2 py-2">
 	<div class="flex flex-col gap-1.5">
+		<!--
+			Who this commit will be attributed to, and the control that changes it.
+			Shown before the commit rather than discovered after the push, which is
+			the whole failure this feature exists to prevent. Only rendered when an
+			identity resolves, so a user who has not set one up sees nothing new.
+		-->
+		{#if resolvedIdentity?.identity && activeProjectId}
+			<GitIdentityPicker projectId={activeProjectId} resolved={resolvedIdentity} />
+		{/if}
 			<textarea
 			bind:this={textareaEl}
 			value={repoPath ? localCommitMessage : gitDraft.commitMessage}
@@ -350,7 +398,7 @@
 					title="Create and switch to this branch"
 				>
 					{#if isCreatingBranch}
-						<div class="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
+						<div class="w-3.5 h-3.5 border-2 border-slate-400/40 border-t-slate-600 dark:border-slate-500/40 dark:border-t-slate-200 rounded-full animate-spin"></div>
 					{:else}
 						<Icon name="lucide:git-branch-plus" class="w-3.5 h-3.5" />
 					{/if}
@@ -378,7 +426,7 @@
 					disabled={stagedCount === 0 || !(repoPath ? localCommitMessage : gitDraft.commitMessage).trim() || isCommitting}
 			>
 				{#if isCommitting}
-					<div class="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
+					<div class="w-3.5 h-3.5 border-2 border-slate-400/40 border-t-slate-600 dark:border-slate-500/40 dark:border-t-slate-200 rounded-full animate-spin"></div>
 					<span>Committing...</span>
 				{:else}
 					<Icon name="lucide:check" class="w-3.5 h-3.5" />
@@ -454,11 +502,19 @@
 					type="button"
 					class="relative flex items-center justify-center w-8 h-7 bg-white dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-md text-slate-500 cursor-pointer transition-all duration-150 hover:bg-violet-500/10 hover:text-violet-600 dark:hover:text-violet-400 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-white dark:disabled:hover:bg-slate-800/80 disabled:hover:text-slate-500 flex-shrink-0"
 					onclick={onPush}
-					disabled={isPushing || !hasRemotes || !onPush || repoBusy}
-					title={repoBusy ? repoBusyReason : hasRemotes ? `Push${branchAhead > 0 ? ` (${branchAhead} ahead)` : ''} — git push -u ${selectedRemote}${branchRef}` : 'No remote configured'}
+					disabled={syncBusy || !hasRemotes || !onPush || repoBusy}
+					title={isPushing
+						? 'Pushing…'
+						: syncBusy
+							? 'Another git action is running…'
+							: repoBusy
+								? repoBusyReason
+								: hasRemotes
+									? `Push${branchAhead > 0 ? ` (${branchAhead} ahead)` : ''}${pushDestination ? ` → ${pushDestination}` : ''}`
+									: 'No remote configured'}
 				>
 					{#if isPushing}
-						<div class="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin flex-shrink-0"></div>
+						<div class="w-3.5 h-3.5 border-2 border-slate-400/40 border-t-slate-600 dark:border-slate-500/40 dark:border-t-slate-200 rounded-full animate-spin flex-shrink-0"></div>
 					{:else}
 						<Icon name="lucide:arrow-up-from-line" class="w-3.5 h-3.5 flex-shrink-0" />
 						{#if branchAhead > 0}
@@ -472,11 +528,19 @@
 					type="button"
 					class="relative flex items-center justify-center w-8 h-7 bg-white dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-md text-slate-500 cursor-pointer transition-all duration-150 hover:bg-violet-500/10 hover:text-violet-600 dark:hover:text-violet-400 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-white dark:disabled:hover:bg-slate-800/80 disabled:hover:text-slate-500 flex-shrink-0"
 					onclick={onPull}
-					disabled={isPulling || !hasRemotes || !onPull || repoBusy}
-					title={repoBusy ? repoBusyReason : hasRemotes ? `Pull${branchBehind > 0 ? ` (${branchBehind} behind)` : ''} — git pull ${selectedRemote}${branchRef}` : 'No remote configured'}
+					disabled={syncBusy || !hasRemotes || !onPull || repoBusy}
+					title={isPulling
+						? 'Pulling…'
+						: syncBusy
+							? 'Another git action is running…'
+							: repoBusy
+								? repoBusyReason
+								: hasRemotes
+									? `Pull${branchBehind > 0 ? ` (${branchBehind} behind)` : ''}${pushDestination ? ` ← ${pushDestination}` : ''}`
+									: 'No remote configured'}
 				>
 					{#if isPulling}
-						<div class="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin flex-shrink-0"></div>
+						<div class="w-3.5 h-3.5 border-2 border-slate-400/40 border-t-slate-600 dark:border-slate-500/40 dark:border-t-slate-200 rounded-full animate-spin flex-shrink-0"></div>
 					{:else}
 						<Icon name="lucide:arrow-down-to-line" class="w-3.5 h-3.5 flex-shrink-0" />
 						{#if branchBehind > 0}
@@ -491,6 +555,7 @@
 				<!-- More git actions -->
 				<GitMoreMenu
 					isBusy={isMoreBusy}
+					disabled={isPushing || isPulling}
 					{hasRemotes}
 					{selectedRemote}
 					{currentBranch}

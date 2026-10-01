@@ -4,13 +4,15 @@
  * Wraps the @anthropic-ai/claude-agent-sdk into the AIEngine interface.
  * SDK messages are converted to EngineOutput by ./message-converter.ts.
  *
- * Currently uses v1 query() API because v2 (unstable_v2_createSession) is
- * @alpha and lacks critical options required by Clopen:
- *   - cwd (multi-project working directory)
- *   - mcpServers, systemPrompt, settingSources
- *   - forkSession, maxTurns, abortController, includePartialMessages
- *   - outputFormat (needed by generateStructured)
- * When v2 SDKSessionOptions gains these, migrate streamQuery() to v2.
+ * query() is the only session entry point. The alternative this comment used to
+ * weigh — the @alpha v2 API (unstable_v2_createSession / unstable_v2_prompt) —
+ * was removed upstream in 0.3.142, before the version Clopen pins, so there is
+ * no migration pending. prewarm() (0.3.284, @alpha) parks a spare process to
+ * take start-up cost off the first message, but everything Clopen varies per
+ * stream is frozen at prewarm time — mcpServers (whose tool handlers are bound
+ * to the project), hooks, canUseTool, env (git identity) — so a spare is only
+ * reusable within one (project × profile × account × identity) and holds
+ * 230-260 MB while parked. Not adopted; see docs/lessons-learned.md §10.25.
  */
 
 import { loadEngineSdk } from '$backend/engine/sdk-loader';
@@ -30,9 +32,11 @@ import { WorkflowTranscriptTailer } from './workflow-transcript';
 import { resolveOsPath } from '$backend/utils/paths';
 import { setupEnvironmentOnce, getEngineEnv } from './environment';
 import { handleStreamError } from './error-handler';
+import { emptyGenerationError } from '../../structured-helpers';
 import { getEnabledMcpServers, getAllowedMcpTools } from '../../../mcp';
 import { syncSkills } from '$backend/skills';
 import { syncEngineArtifacts } from '$backend/engine/artifact-sync';
+import { resolveProjectBridge, ensureClaudeProjectPlugin, buildProjectPromptContext } from '$backend/artifacts/project';
 import { artifactFilter } from '$backend/profiles';
 import { resolvePermissionsFromDb, isToolAllowed, hasAnyRestriction, syncPermissions } from '$backend/permissions';
 import type { AIEngine, EngineQueryOptions } from '../../types';
@@ -178,6 +182,25 @@ export class ClaudeCodeEngine implements AIEngine {
       // equivalent — the PreToolUse hook below is the authoritative enforcement.
       await syncPermissions('claude');
 
+      // The repository's own artifacts Claude doesn't read natively (it reads
+      // `.claude/*` and CLAUDE.md itself via settingSources). All three ride
+      // per-query options, so nothing is written into the repo or into the
+      // isolated config dir another session shares:
+      //   - skills (e.g. `.agents/skills`) → a Clopen-owned local plugin;
+      //   - subagents (e.g. `.agents/agents`) → the SDK `agents` option;
+      //   - AGENTS.md + the Clopen-only project block → the appended system prompt.
+      const projectBridge = await resolveProjectBridge('claude', resolvedProjectPath, options.mcpContext?.projectId);
+      const projectPlugin = await ensureClaudeProjectPlugin(projectBridge);
+      const projectInstructions = buildProjectPromptContext(projectBridge, { instructions: true });
+      const projectAgents = projectBridge.subagents.length > 0
+        ? Object.fromEntries(projectBridge.subagents.map(sub => [sub.slug, {
+          description: sub.description || sub.name,
+          prompt: sub.prompt,
+          ...(sub.tools && { tools: sub.tools }),
+          ...(sub.model && { model: sub.model })
+        }]))
+        : undefined;
+
       // Resolve the effective permission policy once per stream. Enforcement
       // lives in the PreToolUse hook, NOT in canUseTool: under
       // permissionMode 'bypassPermissions' the CLI auto-approves a tool call
@@ -225,9 +248,15 @@ export class ClaudeCodeEngine implements AIEngine {
         permissionMode: 'bypassPermissions' as PermissionMode,
         allowDangerouslySkipPermissions: true,
         cwd: resolvedProjectPath,
-        env: getEngineEnv(accountId),
-        systemPrompt: { type: "preset", preset: "claude_code" },
+        env: getEngineEnv(accountId, options.gitIdentityEnv),
+        systemPrompt: projectInstructions
+          ? { type: "preset", preset: "claude_code", append: projectInstructions }
+          : { type: "preset", preset: "claude_code" },
         settingSources: ["user", "project", "local"],
+        // The plugin carries skills only; its MCP discovery is off because
+        // project MCP servers come through Clopen's trust-gated bridge.
+        ...(projectPlugin && { plugins: [{ type: 'local' as const, path: projectPlugin, skipMcpDiscovery: true }] }),
+        ...(projectAgents && { agents: projectAgents }),
         forkSession: true,
         // Reasoning level → thinking/effort (see thinkingConfig above). Adaptive
         // thinking with summarized display keeps Opus 4.6+ emitting visible
@@ -591,6 +620,6 @@ export class ClaudeCodeEngine implements AIEngine {
       }
     }
 
-    throw new Error(lastError || 'Claude Code did not return valid structured output');
+    throw emptyGenerationError('Claude Code', lastError || undefined);
   }
 }

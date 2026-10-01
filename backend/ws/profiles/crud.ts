@@ -7,7 +7,7 @@
  *   - profiles:available / project-default                         (non-admin)
  *
  * A Profile bundles references to existing artifacts (Skills, Commands,
- * Subagents, MCP Connectors) by slug plus an optional per-engine allow/deny
+ * Subagents, Integrations) by slug plus an optional per-engine allow/deny
  * overlay. Nothing is duplicated — see `backend/profiles`. Admin gating lives in
  * `backend/auth/permissions.ts`; the picker/default-read routes stay non-admin
  * (choosing a profile for a session is a run choice like the model).
@@ -24,7 +24,6 @@ import type { EngineType } from '$shared/types/unified';
 
 const ITEMS_SCHEMA = t.Object({
 	skill: t.Array(t.String()),
-	command: t.Array(t.String()),
 	subagent: t.Array(t.String()),
 	mcp: t.Array(t.String())
 });
@@ -41,7 +40,7 @@ const PROFILE_SCHEMA = t.Object({
 });
 
 const ITEM_INPUT_SCHEMA = t.Array(t.Object({
-	artifactType: t.Union([t.Literal('skill'), t.Literal('command'), t.Literal('subagent'), t.Literal('mcp')]),
+	artifactType: t.Union([t.Literal('skill'), t.Literal('subagent'), t.Literal('mcp')]),
 	ref: t.String()
 }));
 
@@ -72,7 +71,7 @@ export const profilesCrudHandler = createRouter()
 	})
 	.http('profiles:inventory', {
 		data: t.Object({}),
-		response: t.Object({ skill: INVENTORY_ENTRY, command: INVENTORY_ENTRY, subagent: INVENTORY_ENTRY, mcp: INVENTORY_ENTRY })
+		response: t.Object({ skill: INVENTORY_ENTRY, subagent: INVENTORY_ENTRY, mcp: INVENTORY_ENTRY })
 	}, () => {
 		debug.log('path', 'profiles:inventory');
 		return profileService.inventory();

@@ -28,7 +28,7 @@ import Graph from 'graphology';
 import louvain from 'graphology-communities-louvain';
 import { graphQueries } from '$backend/database/queries/graph-queries';
 import { initializeEngine } from '$backend/engine';
-import { resolveGenerationTarget } from '$backend/engine/resolve-model';
+import { resolveGenerationTarget, GENERATION_SETTINGS } from '$backend/engine/resolve-model';
 import { debug } from '$shared/utils/logger';
 import { getMemoryConfig, type MemoryModelConfig } from './config';
 import { notifyGraphChanged } from './notify';
@@ -135,7 +135,6 @@ export async function consolidateMemories(projectId: string | null, projectPath:
 			if (covered.length < MIN_CLUSTER) continue;
 
 			const node = graphQueries.upsert({
-				kind: 'episodic',
 				subkind: summary.subkind,
 				scope: projectId ? 'project' : 'global',
 				projectId,
@@ -181,7 +180,7 @@ export async function consolidateMemories(projectId: string | null, projectPath:
  */
 function findClusters(projectId: string | null): GraphNode[][] {
 	const nodes = graphQueries
-		.list({ projectId, kinds: ['episodic'], limit: 2_000 })
+		.list({ projectId, limit: 2_000 })
 		.filter(
 			node =>
 				node.source === 'agent' &&
@@ -262,7 +261,7 @@ ${listing}`).text;
 		const engine = await initializeEngine(model.engine);
 		if (!engine.generateStructured) return null;
 
-		const target = await resolveGenerationTarget(engine, model.modelId, model.providerSlug);
+		const target = await resolveGenerationTarget(engine, model.modelId, model.providerSlug, GENERATION_SETTINGS.memory);
 		const accountId = model.accountId ?? target.accountId;
 
 		return await engine.generateStructured<Summary>({

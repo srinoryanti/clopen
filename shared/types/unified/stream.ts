@@ -80,9 +80,46 @@ export interface SystemInitEvent {
 	mcpServers: McpServerStatus[];
 }
 
+/**
+ * MCP connection state as the engine reported it at session init.
+ *
+ * The vocabulary is the Claude Agent SDK's, which is the widest any adapter
+ * feeds in; `disconnected` is Clopen's own fallback for a producer that sent no
+ * status at all (Qwen types the field as a bare `string`). Two of these are not
+ * failures and must not raise a toast: `needs-auth` means the server wants
+ * credentials configured in Settings → MCP, and `pending` means still
+ * connecting — routine since claude-agent-sdk 0.3.282 made MCP servers connect
+ * in the background so a slow server no longer delays session start. See the
+ * `system_init` arm of stream-manager.ts.
+ */
 export interface McpServerStatus {
 	name: string;
-	status: 'connected' | 'disconnected' | 'error';
+	status: 'connected' | 'pending' | 'needs-auth' | 'failed' | 'disabled' | 'disconnected';
+}
+
+const MCP_SERVER_STATUSES = new Set<McpServerStatus['status']>([
+	'connected', 'pending', 'needs-auth', 'failed', 'disabled', 'disconnected'
+]);
+
+/**
+ * Narrow an engine-reported MCP status string into the union above.
+ *
+ * Every SDK that carries this field types it as a bare `string` — the Claude
+ * Agent SDK included, whose own richer `McpServerStatus` belongs to a different
+ * API surface than the `system:init` payload. So the value has to be checked,
+ * not asserted, and the check lives here rather than beside each call site: a
+ * per-adapter copy of the vocabulary is how one of them goes stale while
+ * type-checking clean.
+ *
+ * Anything unrecognised or absent becomes `disconnected`, which reads as
+ * "reported nothing usable" and raises a toast. Do not fold it into a soft
+ * status to quiet the toast: a genuinely unreachable server would then be
+ * indistinguishable from one that is still connecting.
+ */
+export function toMcpServerStatus(status: string | undefined): McpServerStatus['status'] {
+	return MCP_SERVER_STATUSES.has(status as McpServerStatus['status'])
+		? (status as McpServerStatus['status'])
+		: 'disconnected';
 }
 
 export type RateLimitType =
@@ -182,6 +219,13 @@ export interface StreamRequest {
 	prompt: UserMessage;
 	engine: MessageEngine;
 	sender: MessageSender;
+	/**
+	 * Server-trusted id of the user who started the stream (from the WS
+	 * connection, never the client-supplied `sender`). Used to route Web Push
+	 * notifications to the requester's devices when Chrome is closed.
+	 * Absent for streams started before this field existed.
+	 */
+	requestedByUserId?: string;
 	/**
 	 * Reasoning/thinking level token chosen for this session (native per engine).
 	 * `null`/absent → the engine's own default applies. Persisted to

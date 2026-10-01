@@ -13,7 +13,13 @@
  */
 
 import { soundNotification, pushNotification } from '$frontend/services/notification';
-import { projectState } from '$frontend/stores/core/projects.svelte';
+import { warmNotificationIcon } from '$frontend/services/notification/notification-icon';
+import {
+  isBackgroundPushSupported,
+  warmPushServiceWorker
+} from '$frontend/services/notification/service-worker-notifications';
+import { ensurePushSubscription } from '$frontend/services/notification/push-subscription.service';
+import { settings } from '$frontend/stores/features/settings.svelte';
 import { debug } from '$shared/utils/logger';
 import ws from '$frontend/utils/ws';
 import { registerProjectCleanup } from '$frontend/utils/project-state-cleanup';
@@ -34,9 +40,42 @@ class GlobalStreamMonitor {
 
     debug.log('notification', 'GlobalStreamMonitor: Initializing WS listeners');
 
+    // Rasterise the notification icon now rather than when a chat finishes,
+    // so the first notification of the session is not the one that pays for it.
+    warmNotificationIcon();
+    // Register the service worker early so the background route is ready
+    // before the first chat completion needs it. This is also what raises
+    // notifications on Android, where a page cannot.
+    warmPushServiceWorker();
+
+    // Re-sync the server subscription for users who enabled push before this
+    // device was registered (or whose subscription the push service expired).
+    // Silent best-effort: the toggle handler reports failures loudly.
+    if (
+      isBackgroundPushSupported() &&
+      settings.pushNotifications &&
+      typeof Notification !== 'undefined' &&
+      Notification.permission === 'granted'
+    ) {
+      void ensurePushSubscription().then((result) => {
+        if (result === 'failed') {
+          debug.warn('notification', 'GlobalStreamMonitor: background push re-sync failed');
+        }
+      });
+    }
+
     // Stream finished — notify on completion
     ws.on('chat:stream-finished', async (data) => {
-      const { projectId, status, chatSessionId, reason } = data;
+      const { projectId, status, chatSessionId, streamId, reason, projectName, sessionTitle } =
+        data as {
+          projectId: string;
+          status: string;
+          chatSessionId: string;
+          streamId?: string;
+          reason?: string;
+          projectName?: string;
+          sessionTitle?: string;
+        };
 
       debug.log('notification', 'GlobalStreamMonitor: Stream finished', { projectId, status, reason });
 
@@ -53,16 +92,27 @@ class GlobalStreamMonitor {
         debug.error('notification', 'Error playing sound notification:', error);
       }
 
-      // Send push notification with project context
+      // Shared tag with the server push for the same stream: the background
+      // copy replaces this local toast instead of duplicating it. Distinct
+      // streams keep distinct tags, so chats never collapse into one toast.
+      const tag = streamId ? `chat-${streamId}` : undefined;
+
+      // Send push notification with project context.
+      //
+      // The context comes off the wire rather than out of a local store: the
+      // sessions store only holds the project currently open, and this handler
+      // exists for the chats the user is *not* looking at. A server upgrade
+      // under an open tab can leave the fields absent, and the shared message
+      // builder drops an absent segment instead of inventing one.
       try {
-        const projectName = projectState.projects.find(p => p.id === projectId)?.name || 'Unknown';
+        const context = { projectName, sessionTitle };
 
         if (status === 'completed') {
-          await pushNotification.sendChatComplete(`Chat response ready in "${projectName}"`);
+          await pushNotification.sendChatEvent('completed', context, tag);
         } else if (status === 'error') {
-          await pushNotification.sendChatError(`Chat error in "${projectName}"`);
+          await pushNotification.sendChatEvent('error', context, tag);
         } else if (status === 'cancelled') {
-          await pushNotification.sendChatComplete(`Chat interrupted in "${projectName}"`);
+          await pushNotification.sendChatEvent('cancelled', context, tag);
         }
       } catch (error) {
         debug.error('notification', 'Error sending push notification:', error);
@@ -71,7 +121,13 @@ class GlobalStreamMonitor {
 
     // Waiting for input — notify once per AskUserQuestion
     ws.on('chat:waiting-input', async (data) => {
-      const { projectId, chatSessionId, toolUseId } = data;
+      const { projectId, chatSessionId, toolUseId, projectName, sessionTitle } = data as {
+        projectId: string;
+        chatSessionId: string;
+        toolUseId: string;
+        projectName?: string;
+        sessionTitle?: string;
+      };
 
       // Deduplicate: only notify once per tool_use ID
       if (this.notifiedToolUseIds.has(toolUseId)) return;
@@ -86,10 +142,14 @@ class GlobalStreamMonitor {
         debug.error('notification', 'Error playing sound notification:', error);
       }
 
-      // Send push notification
+      // Send push notification. Shared tag with the server push for the
+      // same question so the two copies collapse into one toast.
       try {
-        const projectName = projectState.projects.find(p => p.id === projectId)?.name || 'Unknown';
-        await pushNotification.sendChatComplete(`Waiting for your input in "${projectName}"`);
+        await pushNotification.sendChatEvent(
+          'waiting-input',
+          { projectName, sessionTitle },
+          `waiting-${toolUseId}`
+        );
       } catch (error) {
         debug.error('notification', 'Error sending push notification:', error);
       }

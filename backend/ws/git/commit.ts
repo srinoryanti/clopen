@@ -6,7 +6,8 @@ import { t } from 'elysia';
 import path from 'node:path';
 import { createRouter } from '$shared/utils/ws-server';
 import { gitService } from '../../git/git-service';
-import { requireProjectAccess } from '../access';
+import { requireProjectWorkspace } from '../access';
+import { identityEnvFor } from './identity-context';
 import { debug } from '$shared/utils/logger';
 
 /**
@@ -36,9 +37,9 @@ export const commitHandler = createRouter()
 			hash: t.String()
 		})
 	}, async ({ data, conn }) => {
-		const project = requireProjectAccess(conn, data.projectId);
-		const cwd = resolveRepoCwd(project.path, data.repoPath);
-		const hash = await gitService.commit(cwd, data.message);
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
+		const hash = await gitService.commit(cwd, data.message, identityEnvFor(conn, data.projectId));
 		return { hash };
 	})
 
@@ -52,9 +53,9 @@ export const commitHandler = createRouter()
 			hash: t.String()
 		})
 	}, async ({ data, conn }) => {
-		const project = requireProjectAccess(conn, data.projectId);
-		const cwd = resolveRepoCwd(project.path, data.repoPath);
-		const hash = await gitService.amendCommit(cwd, data.message);
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
+		const hash = await gitService.amendCommit(cwd, data.message, identityEnvFor(conn, data.projectId));
 		return { hash };
 	})
 
@@ -66,8 +67,8 @@ export const commitHandler = createRouter()
 		}),
 		response: t.Object({ ok: t.Boolean() })
 	}, async ({ data, conn }) => {
-		const project = requireProjectAccess(conn, data.projectId);
-		const cwd = resolveRepoCwd(project.path, data.repoPath);
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
 		await gitService.undoLastCommit(cwd, data.mode);
 		return { ok: true };
 	})
@@ -83,9 +84,9 @@ export const commitHandler = createRouter()
 			message: t.String()
 		})
 	}, async ({ data, conn }) => {
-		const project = requireProjectAccess(conn, data.projectId);
-		const cwd = resolveRepoCwd(project.path, data.repoPath);
-		return await gitService.revertCommit(cwd, data.ref);
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
+		return await gitService.revertCommit(cwd, data.ref, identityEnvFor(conn, data.projectId));
 	})
 
 	.http('git:cherry-pick', {
@@ -99,9 +100,9 @@ export const commitHandler = createRouter()
 			message: t.String()
 		})
 	}, async ({ data, conn }) => {
-		const project = requireProjectAccess(conn, data.projectId);
-		const cwd = resolveRepoCwd(project.path, data.repoPath);
-		return await gitService.cherryPick(cwd, data.hashes);
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
+		return await gitService.cherryPick(cwd, data.hashes, identityEnvFor(conn, data.projectId));
 	})
 
 	.http('git:clean', {
@@ -111,8 +112,8 @@ export const commitHandler = createRouter()
 		}),
 		response: t.Object({ message: t.String() })
 	}, async ({ data, conn }) => {
-		const project = requireProjectAccess(conn, data.projectId);
-		const cwd = resolveRepoCwd(project.path, data.repoPath);
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
 		const message = await gitService.cleanUntracked(cwd);
 		return { message };
 	})
@@ -124,8 +125,8 @@ export const commitHandler = createRouter()
 		}),
 		response: t.Object({ message: t.String() })
 	}, async ({ data, conn }) => {
-		const project = requireProjectAccess(conn, data.projectId);
-		const cwd = resolveRepoCwd(project.path, data.repoPath);
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
 		const message = await gitService.optimize(cwd);
 		return { message };
 	})
@@ -142,7 +143,7 @@ export const commitHandler = createRouter()
 			message: t.String()
 		})
 	}, async ({ data, conn }) => {
-		const project = requireProjectAccess(conn, data.projectId);
-		const cwd = resolveRepoCwd(project.path, data.repoPath);
-		return await gitService.npmVersion(cwd, data.bump);
+		const { root } = requireProjectWorkspace(conn, data.projectId);
+		const cwd = resolveRepoCwd(root, data.repoPath);
+		return await gitService.npmVersion(cwd, data.bump, identityEnvFor(conn, data.projectId));
 	});

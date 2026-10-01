@@ -2,7 +2,7 @@
  * Profiles Store
  *
  * Reactive store for Settings → Profiles — reusable bundles that reference
- * existing artifacts (Skills, Commands, Subagents, MCP Connectors) by slug, plus
+ * existing artifacts (Skills, Commands, Subagents, Integrations) by slug, plus
  * an optional per-engine permission overlay. A profile is activated per-session
  * (see the picker) and resolved at stream start against the project's shared
  * default. Nothing here duplicates artifact data.
@@ -11,11 +11,10 @@
 import ws from '$frontend/utils/ws';
 import { debug } from '$shared/utils/logger';
 
-export type ProfileItemType = 'skill' | 'command' | 'subagent' | 'mcp';
+export type ProfileItemType = 'skill' | 'subagent' | 'mcp';
 
 export interface ProfileItems {
 	skill: string[];
-	command: string[];
 	subagent: string[];
 	mcp: string[];
 }
@@ -67,7 +66,7 @@ let availableLoaded = $state(false);
 
 function itemsToArray(items: ProfileItems): { artifactType: ProfileItemType; ref: string }[] {
 	const out: { artifactType: ProfileItemType; ref: string }[] = [];
-	(['skill', 'command', 'subagent', 'mcp'] as ProfileItemType[]).forEach(type => {
+	(['skill', 'subagent', 'mcp'] as ProfileItemType[]).forEach(type => {
 		for (const ref of items[type]) out.push({ artifactType: type, ref });
 	});
 	return out;

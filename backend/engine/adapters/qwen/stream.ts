@@ -39,7 +39,7 @@ import type {
 import { loadEngineSdk } from '$backend/engine/sdk-loader';
 import type { EngineOutput, EngineModel } from '$shared/types/unified';
 import type { AIEngine, EngineQueryOptions, StructuredGenerationOptions } from '../../types';
-import { buildJsonPrompt, extractJson } from '../../structured-helpers';
+import { buildJsonPrompt, extractJson, emptyGenerationError } from '../../structured-helpers';
 import { resolveOsPath } from '$backend/utils/paths';
 import { debug } from '$shared/utils/logger';
 import { getEngineEnv } from './environment';
@@ -51,6 +51,7 @@ import { EngineRuns } from '../run-registry';
 import { artifactFilter } from '$backend/profiles';
 import { syncSkills } from '$backend/skills';
 import { syncEngineArtifacts } from '$backend/engine/artifact-sync';
+import { resolveProjectBridge, buildProjectPromptContext } from '$backend/artifacts/project';
 import { resolvePermissionsFromDb, isToolAllowed, excludedBuiltinTools } from '$backend/permissions';
 import { forkQwenSessionState, sessionStateExists } from './session-fork';
 
@@ -150,7 +151,9 @@ export class QwenEngine implements AIEngine {
 		if (!resolution) {
 			throw new Error('Qwen Code is not configured. Add an API key in Settings → Engines → Qwen Code.');
 		}
-		const { env } = resolution;
+		// Layered here rather than inside `getEngineEnv` because the identity is a
+		// property of the turn, while that function answers "which account".
+		const env = { ...resolution.env, ...(options.gitIdentityEnv ?? {}) };
 
 		const controller = abortController || new AbortController();
 		const run: QwenRun = { controller, query: null, converter: null, pendingAskUserQuestion: null };
@@ -163,6 +166,12 @@ export class QwenEngine implements AIEngine {
 		await syncSkills('qwen', profileId);
 		await syncEngineArtifacts('qwen', profileId);
 		const mcpConfig = getQwenMcpConfig(mcpProfileFilter, options.mcpContext);
+		// Repository artifacts Qwen doesn't read natively (it reads `.qwen/*`,
+		// QWEN.md and AGENTS.md itself) — appended to its preset system prompt,
+		// which is per query. Qwen has no delegation surface Clopen can register
+		// with, so project subagents are never advertised to it.
+		const projectBridge = await resolveProjectBridge('qwen', resolvedProjectPath, options.mcpContext?.projectId);
+		const projectContext = buildProjectPromptContext(projectBridge, { skills: true, instructions: true });
 
 		// Resolve the permission policy once per stream; canUseTool enforces it
 		// (Qwen otherwise auto-allows everything). Tool names arrive snake_cased.
@@ -311,6 +320,7 @@ export class QwenEngine implements AIEngine {
 					// Auto-allow everything else.
 					return { behavior: 'allow' as const, updatedInput: input };
 				},
+				...(projectContext ? { systemPrompt: { type: 'preset' as const, preset: 'qwen_code' as const, append: projectContext } } : {}),
 				...(maxTurns !== undefined ? { maxSessionTurns: maxTurns } : {}),
 				...(resumeId ? { resume: resumeId } : {}),
 				...(Object.keys(mcpConfig).length > 0 ? { mcpServers: mcpConfig } : {}),
@@ -474,7 +484,7 @@ export class QwenEngine implements AIEngine {
 		}
 
 		if (!resultText) {
-			throw new Error(errorMessage || 'Qwen returned no result text');
+			throw emptyGenerationError('Qwen Code', errorMessage || undefined);
 		}
 
 		return extractJson<T>(resultText);

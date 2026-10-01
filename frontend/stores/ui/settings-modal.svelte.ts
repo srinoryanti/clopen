@@ -9,15 +9,16 @@ import type { EngineType } from '$shared/types/unified';
 export type SettingsSection =
 	| 'assistant'
 	| 'commit-message'
+	| 'git-identities'
 	| 'artifacts'
 	| 'engines'
 	| 'stack'
-	| 'mcp'
+	| 'integrations'
 	| 'skills'
-	| 'commands'
 	| 'subagents'
 	| 'instructions'
 	| 'permissions'
+	| 'file-shares'
 	| 'memory'
 	| 'memory-graph'
 	| 'profiles'
@@ -62,6 +63,15 @@ interface SettingsModalState {
 	 * and clears it.
 	 */
 	teamFocusUserId: string | null;
+	/**
+	 * Provider whose Connect dialog should open as soon as Integrations is shown.
+	 *
+	 * Set by a CTA that already knows what the user is trying to connect — the
+	 * Issues & PRs surface's empty state, for one. Sending them to a list and letting
+	 * them find Add → GitHub is three clicks of looking for something we already
+	 * knew. IntegrationsSettings consumes and clears it.
+	 */
+	integrationFocusProvider: string | null;
 }
 
 // Settings sections metadata
@@ -88,6 +98,13 @@ export const settingsSections: SettingsSectionMeta[] = [
 		icon: 'lucide:git-branch',
 		description: 'Commits and branches',
 		group: 'models'
+	},
+	{
+		id: 'git-identities',
+		label: 'Git Accounts',
+		icon: 'lucide:user-round-cog',
+		description: 'Commit identity and credentials',
+		group: 'infrastructure'
 	},
 	{
 		id: 'artifacts',
@@ -137,10 +154,25 @@ export const settingsSections: SettingsSectionMeta[] = [
 		adminOnly: true
 	},
 	{
-		id: 'mcp',
-		label: 'Connectors',
+		id: 'file-shares',
+		label: 'File Shares',
+		icon: 'lucide:link',
+		// Infrastructure, not Artifacts & Access: a share link is a way out of
+		// this server, like a tunnel — nothing to do with what an engine can
+		// reach. Not adminOnly either, because any member can mint one from the
+		// Explorer and therefore needs somewhere to withdraw it; the server
+		// scopes the list, admins see every link.
+		description: 'Links that expose a single file',
+		group: 'infrastructure'
+	},
+	{
+		id: 'integrations',
+		label: 'Integrations',
 		icon: 'lucide:plug',
-		description: 'Connect external tools (MCP)',
+		// Absorbed the old Connectors section: built-in tools, connected accounts
+		// and hand-installed MCP servers are one list now, because two places to
+		// connect a service means two tokens in two tables.
+		description: 'Connected services and tools',
 		group: 'artifacts-access',
 		adminOnly: true
 	},
@@ -148,15 +180,10 @@ export const settingsSections: SettingsSectionMeta[] = [
 		id: 'skills',
 		label: 'Skills',
 		icon: 'lucide:graduation-cap',
-		description: 'Reusable agent instructions',
-		group: 'artifacts-access',
-		adminOnly: true
-	},
-	{
-		id: 'commands',
-		label: 'Commands',
-		icon: 'lucide:terminal',
-		description: 'Custom slash commands',
+		// Absorbed the old Commands section: a slash command is a skill the user
+		// invokes by name instead of one the agent picks up, so two menus meant
+		// two editors over one artifact.
+		description: 'Reusable prompts and /commands',
 		group: 'artifacts-access',
 		adminOnly: true
 	},
@@ -252,7 +279,8 @@ export const settingsModalState = $state<SettingsModalState>({
 	isOpen: false,
 	activeSection: 'assistant',
 	engineFocus: null,
-	teamFocusUserId: null
+	teamFocusUserId: null,
+	integrationFocusProvider: null
 });
 
 // Helper functions
@@ -271,6 +299,19 @@ export function setActiveSection(section: SettingsSection) {
 
 export function toggleSettingsModal() {
 	settingsModalState.isOpen = !settingsModalState.isOpen;
+}
+
+/**
+ * Open Integrations with one provider's Connect dialog already up.
+ *
+ * `providerId` is a hint, not a promise: a provider that is not in the registry
+ * (or is already connected) simply lands on the list, which is the same place
+ * the user would have arrived at anyway.
+ */
+export function openIntegrationConnect(providerId: string) {
+	settingsModalState.isOpen = true;
+	settingsModalState.activeSection = 'integrations';
+	settingsModalState.integrationFocusProvider = providerId;
 }
 
 /** Switch to the Engines section and request a specific engine sub-tab. */

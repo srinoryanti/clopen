@@ -23,16 +23,17 @@ import type { Codex, Thread, ThreadOptions, Input as CodexInput, ModelReasoningE
 import { loadEngineSdk } from '$backend/engine/sdk-loader';
 import type { EngineOutput, EngineModel } from '$shared/types/unified';
 import type { AIEngine, EngineQueryOptions, StructuredGenerationOptions } from '../../types';
-import { extractJson } from '../../structured-helpers';
+import { extractJson, emptyGenerationError } from '../../structured-helpers';
 import { engineQueries } from '$backend/database/queries/engine-queries';
 import { resolveOsPath } from '$backend/utils/paths';
 import { resolveEngineCli } from '$backend/engine/engine-cli';
 import { getCleanSpawnEnv } from '$backend/utils/index.js';
-import { getCodexMcpConfig } from '../../../mcp';
+import { getCodexMcpConfig, getTrustedProjectServers } from '../../../mcp';
 import { EngineRuns } from '../run-registry';
 import { artifactFilter } from '$backend/profiles';
 import { syncSkills } from '$backend/skills';
 import { syncEngineArtifacts, buildArtifactsPromptContext } from '$backend/engine/artifact-sync';
+import { resolveProjectBridge } from '$backend/artifacts/project';
 import { CODEX_MODELS, resolveCodexEffort } from './models';
 import { debug } from '$shared/utils/logger';
 import { handleStreamError, buildTurnError } from './error-handler';
@@ -62,6 +63,17 @@ interface CodexRun {
 	/** Identity of the run — the controller the caller passed to streamQuery. */
 	controller: AbortController;
 	thread: Thread | null;
+}
+
+/**
+ * A stable key for an identity environment, so "same identity?" is a string
+ * compare rather than a deep object compare. Sorted because the builder's key
+ * order is an implementation detail, not a difference.
+ */
+function gitIdentityKey(env: Record<string, string>): string {
+	const keys = Object.keys(env).sort();
+	if (keys.length === 0) return '';
+	return keys.map((k) => `${k}=${env[k]}`).join('\u0000');
 }
 
 export class CodexEngine implements AIEngine {
@@ -104,6 +116,17 @@ export class CodexEngine implements AIEngine {
 	 * satisfying that type.
 	 */
 	private pendingProjectId: string | null = null;
+	/**
+	 * Git identity baked into the current client, as a comparable key.
+	 *
+	 * The SDK takes `env` at construction and does not re-read it, so the
+	 * identity is part of what the client IS — exactly like the account and the
+	 * MCP set. Stored as a stable string so a turn can ask "is this still the
+	 * right client" without deep-comparing the environment.
+	 */
+	private currentGitIdentityKey: string | null = null;
+	/** Identity for the client `initialize()` is about to build. */
+	private pendingGitIdentityEnv: Record<string, string> = {};
 
 	get isInitialized(): boolean {
 		return this._isInitialized;
@@ -113,8 +136,20 @@ export class CodexEngine implements AIEngine {
 		return this.runs.isActive;
 	}
 
+	/**
+	 * Identity of the MCP set baked into the client: the Profile's connector
+	 * filter plus the project's approved `.agents/mcp.json` servers. Approving,
+	 * revoking or editing that file changes the key, so the next turn rebuilds
+	 * the client instead of serving a stale server list.
+	 */
+	private mcpKeyFor(mcpProfileFilter: Set<string> | undefined, projectId: string | null): string {
+		const filterKey = mcpProfileFilter ? [...mcpProfileFilter].sort().join(',') : '*';
+		const projectKey = getTrustedProjectServers(projectId).map(s => s.namespace).sort().join(',');
+		return `${filterKey}|${projectKey}`;
+	}
+
 	async initialize(accountId?: number, mcpProfileFilter?: Set<string>): Promise<void> {
-		const mcpKey = mcpProfileFilter ? [...mcpProfileFilter].sort().join(',') : '*';
+		const mcpKey = this.mcpKeyFor(mcpProfileFilter, this.pendingProjectId);
 		if (this._isInitialized && (accountId == null || accountId === this.currentAccountId) && mcpKey === this.currentMcpFilterKey) {
 			return;
 		}
@@ -161,7 +196,7 @@ export class CodexEngine implements AIEngine {
 		this.codex = new Codex({
 			apiKey: credential.kind === 'api_key' ? credential.apiKey : undefined,
 			...(codexCli ? { codexPathOverride: codexCli.path } : {}),
-			env: { ...getCleanSpawnEnv(), CODEX_HOME: getCodexHomeDir() },
+			env: { ...getCleanSpawnEnv(), CODEX_HOME: getCodexHomeDir(), ...this.pendingGitIdentityEnv },
 			config: {
 				show_raw_agent_reasoning: true,
 				...(Object.keys(mcpConfig).length > 0 ? { mcp_servers: mcpConfig } : {}),
@@ -170,6 +205,7 @@ export class CodexEngine implements AIEngine {
 		this.currentAccountId = account.id;
 		this.currentMcpFilterKey = mcpKey;
 		this.currentProjectId = projectId;
+		this.currentGitIdentityKey = gitIdentityKey(this.pendingGitIdentityEnv);
 		this._isInitialized = true;
 		debug.log('engine', `Codex engine initialized (account ${account.id}, mode=${credential.kind}, mcpFilter=${mcpKey}, project=${projectId ?? 'none'})`);
 	}
@@ -180,6 +216,7 @@ export class CodexEngine implements AIEngine {
 		this.currentAccountId = null;
 		this.currentMcpFilterKey = null;
 		this.currentProjectId = null;
+		this.currentGitIdentityKey = null;
 		this._isInitialized = false;
 		debug.log('engine', 'Codex engine disposed');
 	}
@@ -210,7 +247,7 @@ export class CodexEngine implements AIEngine {
 		// Qwen/Copilot do per stream); `undefined` = unfiltered → no change for the
 		// common no-profile path.
 		const mcpProfileFilter = artifactFilter(profileId, 'mcp') ?? undefined;
-		const mcpKey = mcpProfileFilter ? [...mcpProfileFilter].sort().join(',') : '*';
+		const mcpKey = this.mcpKeyFor(mcpProfileFilter, options.mcpContext?.projectId ?? null);
 		const accountChanged = this._isInitialized && accountId != null && accountId !== this.currentAccountId;
 		const mcpChanged = this._isInitialized && mcpKey !== this.currentMcpFilterKey;
 		// A client built without a project (the bare `initialize()` the engine
@@ -219,11 +256,19 @@ export class CodexEngine implements AIEngine {
 		// ended up opening tabs in another.
 		const streamProjectId = options.mcpContext?.projectId ?? null;
 		const projectChanged = this._isInitialized && streamProjectId !== null && streamProjectId !== this.currentProjectId;
-		if (accountChanged || mcpChanged || projectChanged) {
-			debug.log('engine', `Codex re-initialising (accountChanged=${accountChanged}, mcpChanged=${mcpChanged}, projectChanged=${projectChanged})`);
+		// One client serves every turn, so a turn requested by a different user —
+		// or in a project bound to a different identity — must not inherit the
+		// previous requester's git identity. Re-creating the client is the only
+		// way to change an env the SDK already baked.
+		const streamGitIdentityEnv = options.gitIdentityEnv ?? {};
+		const identityChanged =
+			this._isInitialized && gitIdentityKey(streamGitIdentityEnv) !== this.currentGitIdentityKey;
+		if (accountChanged || mcpChanged || projectChanged || identityChanged) {
+			debug.log('engine', `Codex re-initialising (accountChanged=${accountChanged}, mcpChanged=${mcpChanged}, projectChanged=${projectChanged}, identityChanged=${identityChanged})`);
 			await this.dispose();
 		}
 		this.pendingProjectId = streamProjectId;
+		this.pendingGitIdentityEnv = streamGitIdentityEnv;
 		if (!this._isInitialized || !this.codex) {
 			await this.initialize(accountId, mcpProfileFilter);
 		}
@@ -287,7 +332,11 @@ export class CodexEngine implements AIEngine {
 			// Prompt-scoped engine: advertise the profile-scoped Skills/Commands/
 			// Subagents PER-SESSION via the prompt (not the shared global AGENTS.md /
 			// persistent client) so the active Profile scopes them correctly.
-			const artifactsContext = buildArtifactsPromptContext(profileId);
+			// Codex reads AGENTS.md and `.agents/skills` itself; anything else the
+			// repo carries (e.g. `.claude/skills`, the Clopen-only project block)
+			// rides the same per-turn prompt context.
+			const projectBridge = await resolveProjectBridge('codex', resolvedProjectPath, options.mcpContext?.projectId);
+			const artifactsContext = buildArtifactsPromptContext('codex', profileId, projectBridge);
 			const input = await buildCodexInput(prompt, artifactsContext || undefined);
 			const { events } = await thread.runStreamed(input, {
 				signal: controller.signal,
@@ -429,7 +478,7 @@ export class CodexEngine implements AIEngine {
 			});
 
 			if (!turn.finalResponse) {
-				throw new Error('Codex returned empty response');
+				throw emptyGenerationError('Codex');
 			}
 
 			return extractJson<T>(turn.finalResponse);

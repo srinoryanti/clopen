@@ -6,10 +6,18 @@
 	import { getFileIcon } from '$frontend/utils/file-icon-mappings';
 	import { getFolderIcon } from '$frontend/utils/folder-icon-mappings';
 	import { getGitStatusColor, getGitStatusBadgeLabel, getGitStatusLabel } from '$frontend/utils/git-status';
-	import { onMount } from 'svelte';
-	import { isLocalConnection, isMac, isWindows, isLinux } from '$frontend/utils/platform';
+	import { aiMarkerState, aiMarkerTooltip } from '$frontend/utils/ai-change-marker';
+	import { openAiChanges } from '$frontend/stores/ui/ai-changes-modal.svelte';
+	import { onMount, tick } from 'svelte';
+	import { isLocalConnection, isMac, isWindows, isLinux, getExplorerShortcutLabels } from '$frontend/utils/platform';
 	import { ignoredPathsState } from '$frontend/stores/features/ignored-paths.svelte';
 	import { isExtractableArchive } from '$frontend/utils/archive';
+
+	// OS-aware shortcut hint (Delete on Windows/Linux, Delete/Backspace on
+	// macOS) carried on the Delete row's tooltip and accessible name, matching
+	// what the keyboard handler actually listens for. Cut/Copy/Paste rows
+	// intentionally show plain labels without shortcut text.
+	const explorerKeys = getExplorerShortcutLabels();
 
 	const {
 		file,
@@ -24,11 +32,14 @@
 		onMenuToggle,
 		expandedFolders,
 		hasClipboard = false,
+		canPaste = false,
+		cutPaths = new Set<string>(),
 		modifiedFiles = new Set<string>(),
 		activeFilePath = null,
 		gitStatusMap = new Map<string, string>(),
 		gitFolderStatusMap = new Map<string, string>(),
 		selectedPaths = new Set<string>(),
+		cursorPath = null,
 		onClick,
 		onNodeDragStart,
 		onNodeDragOver,
@@ -36,8 +47,7 @@
 		onNodeDrop,
 		onNodeDragEnd,
 		dropTargetPath = null,
-		busyPaths = new Set<string>(),
-		aiChangesSet = new Set<string>()
+		busyPaths = new Set<string>()
 	}: {
 		file: FileNodeType;
 		isSelected?: boolean;
@@ -51,11 +61,15 @@
 		onMenuToggle?: (filePath: string) => void;
 		expandedFolders?: Set<string>;
 		hasClipboard?: boolean;
+		canPaste?: boolean;
+		cutPaths?: Set<string>;
 		modifiedFiles?: Set<string>;
 		activeFilePath?: string | null;
 		gitStatusMap?: Map<string, string>;
 		gitFolderStatusMap?: Map<string, string>;
 		selectedPaths?: Set<string>;
+		/** Keyboard/mouse cursor row — owns the tree's primary highlight. */
+		cursorPath?: string | null;
 		onClick?: (file: FileNodeType, event: MouseEvent | KeyboardEvent) => void;
 		onNodeDragStart?: (file: FileNodeType, event: DragEvent) => void;
 		onNodeDragOver?: (file: FileNodeType, event: DragEvent) => void;
@@ -64,7 +78,6 @@
 		onNodeDragEnd?: (file: FileNodeType, event: DragEvent) => void;
 		dropTargetPath?: string | null;
 		busyPaths?: Set<string>;
-		aiChangesSet?: Set<string>;
 	} = $props();
 
 	const revealLabel = $derived(
@@ -78,16 +91,28 @@
 
 	const isBusy = $derived(busyPaths.has(file.path));
 
-	// Determine if this node is the active file
-	const isActiveFile = $derived(
-		activeFilePath ? file.path === activeFilePath : isSelected
-	);
-
-	// Multi-selection membership (separate from the single active-file highlight).
+	// Multi-selection membership.
 	const isInSelection = $derived(selectedPaths.has(file.path));
+
+	// The tree shows exactly ONE primary highlight, and the cursor owns it as
+	// soon as it moves. Keying this off activeFilePath alone left the strong
+	// background on the previously opened file whenever the cursor moved
+	// somewhere that opens no tab (a folder) or had not opened one yet, which
+	// reads as a highlight left behind rather than a highlight that moved.
+	// The cursor only fills when it is part of the selection: Ctrl+arrows and
+	// Ctrl+click-to-deselect park it outside on purpose, and there the focus
+	// ring marks it while the selection keeps the fill. With no cursor at all
+	// — fresh load, cleared selection — the open file keeps the highlight.
+	const isActiveFile = $derived(
+		cursorPath !== null
+			? file.path === cursorPath && (selectedPaths.size === 0 || isInSelection)
+			: (activeFilePath ? file.path === activeFilePath : isSelected)
+	);
 	const isDropTarget = $derived(
 		file.type === 'directory' && dropTargetPath !== null && dropTargetPath === file.path
 	);
+	// Cut-pending-paste feedback (visual only — drag & drop untouched).
+	const isCut = $derived(cutPaths.has(file.path));
 
 	// Compute if this node's menu is open
 	const isMenuOpen = $derived(openMenuPath === file.path);
@@ -121,30 +146,47 @@
 		gitStatusCode ? getGitStatusBadgeLabel(gitStatusCode) : ''
 	);
 
-	// AI changes indicator
-	const hasAiChanges = $derived(
-		file.type === 'file' && aiChangesSet.has(file.path)
-	);
+	// AI changes indicator. Live while the change is still unstaged, dimmed once
+	// it has been staged or committed — see utils/ai-change-marker.ts.
+	const aiMarker = $derived(file.type === 'file' ? aiMarkerState(file.path) : null);
 
 	let nodeElement: HTMLDivElement;
 	let menuButtonElement: HTMLButtonElement;
+	let menuElement: HTMLDivElement | null = $state(null);
 	let menuStyle = $state('');
 
-	function computeMenuStyle(x: number, y: number, alignRight: boolean): string {
-		const menuHeight = 200;
-		const isAbove = y + menuHeight > window.innerHeight && y > menuHeight;
-		const verticalStyle = isAbove
-			? `bottom: ${window.innerHeight - y}px;`
-			: `top: ${y}px;`;
-		const horizontalStyle = alignRight ? `right: ${x}px;` : `left: ${x}px;`;
-		return `${horizontalStyle} ${verticalStyle}`;
+	// Responsive positioning for EVERY row: the menu is first placed at the
+	// anchor point, then measured and fitted into the viewport on the next
+	// frame — flipped above the clicked item when there is no room below,
+	// shifted left when there is no room on the right, and clamped with a
+	// margin otherwise. The old fixed 200px height guess underestimated the
+	// real menu, so bottom rows rendered off-screen under the taskbar.
+	async function fitMenuToViewport(anchorX: number, anchorY: number, alignRight: boolean): Promise<void> {
+		await tick();
+		const el = menuElement;
+		if (!el) return;
+		const margin = 8;
+		const { width, height } = el.getBoundingClientRect();
+		let x = alignRight ? anchorX - width : anchorX;
+		let y = anchorY;
+		// No room below → open above the clicked item.
+		if (y + height > window.innerHeight - margin) {
+			y = Math.max(margin, anchorY - height);
+		}
+		// No room on the right → open to the left of the click.
+		if (x + width > window.innerWidth - margin) {
+			x = Math.max(margin, anchorX - width);
+		}
+		if (x < margin) x = margin;
+		menuStyle = `left: ${x}px; top: ${y}px;`;
 	}
 
 	function toggleMenu(event: Event) {
 		event.stopPropagation();
 		if (!isMenuOpen) {
 			const rect = menuButtonElement.getBoundingClientRect();
-			menuStyle = computeMenuStyle(window.innerWidth - rect.right, rect.bottom, true);
+			menuStyle = `left: ${rect.right}px; top: ${rect.bottom}px;`;
+			void fitMenuToViewport(rect.right, rect.bottom, true);
 		}
 		onMenuToggle?.(file.path);
 	}
@@ -178,7 +220,8 @@
 		event.preventDefault();
 		if (isBusy) return;
 		if (!isMenuOpen) {
-			menuStyle = computeMenuStyle(event.clientX, event.clientY, false);
+			menuStyle = `left: ${event.clientX}px; top: ${event.clientY}px;`;
+			void fitMenuToViewport(event.clientX, event.clientY, false);
 		}
 		onMenuToggle?.(file.path);
 	}
@@ -204,16 +247,21 @@
 	});
 </script>
 
+<!-- data-hoverable marks rows that actually carry a :hover background, so the
+     keyboard-nav hover suppression in app.css cannot blank out a selected
+     row's own background when the stale pointer happens to rest on it. -->
 <div
 	bind:this={nodeElement}
+	data-path={file.path}
+	data-hoverable={isActiveFile || isInSelection ? undefined : ''}
 	class="group relative flex items-center space-x-2 px-2 py-1.5 rounded-md transition-colors {isActiveFile
 		? 'bg-violet-500/10 dark:bg-violet-500/15 text-slate-900 dark:text-slate-100'
 		: isInSelection
 			? 'bg-violet-500/5 dark:bg-violet-500/10 text-slate-900 dark:text-slate-100'
-			: 'hover:bg-slate-100/50 dark:hover:bg-slate-800/50'} {isDropTarget ? 'ring-2 ring-violet-500/60 ring-inset' : ''} {isBusy ? 'opacity-60 cursor-not-allowed pointer-events-none' : 'cursor-pointer'}"
+			: 'hover:bg-slate-100/50 dark:hover:bg-slate-800/50'} {isDropTarget ? 'ring-2 ring-violet-500/60 ring-inset' : ''} {isCut ? 'opacity-50' : ''} {isBusy ? 'opacity-60 cursor-not-allowed pointer-events-none' : 'cursor-pointer'} focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-violet-500/60"
 	class:selected={isActiveFile}
 	class:directory={file.type === 'directory'}
-	title={file.name}
+	title={isCut ? `${file.name} (cut)` : file.name}
 	style="padding-left: {(depth * 12 + 6) / 16}rem"
 	aria-busy={isBusy ? 'true' : undefined}
 	onclick={handleClick}
@@ -266,7 +314,7 @@
 	</span>
 
 	<!-- Status indicators (unsaved dot + ai dot + git status letter) -->
-	{#if showModifiedIndicator || hasAiChanges || gitStatusCode}
+	{#if showModifiedIndicator || aiMarker || gitStatusCode}
 		<span class="flex items-center gap-1 flex-shrink-0 {isIgnored ? 'opacity-40' : ''}">
 			{#if showModifiedIndicator}
 				<span
@@ -274,11 +322,16 @@
 					title="Unsaved changes"
 				></span>
 			{/if}
-			{#if hasAiChanges}
-				<span
-					class="w-1.5 h-1.5 rounded-full bg-violet-500 dark:bg-violet-400"
-					title="Has AI changes"
-				></span>
+			{#if aiMarker}
+				<button
+					type="button"
+					class="w-1.5 h-1.5 rounded-full border-none p-0 cursor-pointer {aiMarker === 'live'
+						? 'bg-violet-500 dark:bg-violet-400'
+						: 'bg-violet-500/30 dark:bg-violet-400/30'}"
+					title={aiMarkerTooltip(file.path)}
+					onclick={(e) => { e.stopPropagation(); openAiChanges(file.path); }}
+					aria-label="Review this chat's changes to this file"
+				></button>
 			{/if}
 			{#if gitStatusCode}
 				<span
@@ -304,6 +357,7 @@
 
 			{#if isMenuOpen}
 			<div
+				bind:this={menuElement}
 				role="menu"
 				tabindex="-1"
 				class="fixed bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg py-1 w-44 max-h-80 overflow-y-auto z-50 shadow-lg"
@@ -351,6 +405,7 @@
 				<button
 					class="w-full px-3 py-1.5 text-xs text-left text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-2"
 					onclick={(e) => { handleAction('cut', e); closeMenu(); }}
+					title="Cut"
 				>
 					<Icon name="lucide:scissors" class="w-3 h-3" />
 					Cut
@@ -359,20 +414,31 @@
 				<button
 					class="w-full px-3 py-1.5 text-xs text-left text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-2"
 					onclick={(e) => { handleAction('copy', e); closeMenu(); }}
+					title="Copy"
 				>
 					<Icon name="lucide:copy" class="w-3 h-3" />
 					Copy
 				</button>
 
-				{#if hasClipboard && file.type === 'directory'}
+				{#if file.type === 'directory' && canPaste}
 					<button
 						class="w-full px-3 py-1.5 text-xs text-left text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-2"
 						onclick={(e) => { handleAction('paste', e); closeMenu(); }}
+						title={hasClipboard ? 'Paste' : 'Paste from system clipboard'}
 					>
 						<Icon name="lucide:clipboard" class="w-3 h-3" />
 						Paste
 					</button>
 				{/if}
+
+				<button
+					class="w-full px-3 py-1.5 text-xs text-left text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-2"
+					onclick={(e) => { handleAction('select-all', e); closeMenu(); }}
+					title="Select All"
+				>
+					<Icon name="lucide:text-select" class="w-3 h-3" />
+					Select All
+				</button>
 
 				<div class="border-t border-slate-200 dark:border-slate-700 my-1"></div>
 
@@ -413,6 +479,14 @@
 					>
 						<Icon name="lucide:download" class="w-3 h-3" />
 						Download File
+					</button>
+
+					<button
+						class="w-full px-3 py-1.5 text-xs text-left text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-2"
+						onclick={(e) => { handleAction('share', e); closeMenu(); }}
+					>
+						<Icon name="lucide:share-2" class="w-3 h-3" />
+						Share Link…
 					</button>
 				{/if}
 
@@ -457,9 +531,11 @@
 				<button
 					class="w-full px-3 py-1.5 text-xs text-left text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 flex items-center gap-2"
 					onclick={(e) => { handleAction('delete', e); closeMenu(); }}
+					title={`Delete (${explorerKeys.deleteKey})`}
+					aria-label={`Delete (${explorerKeys.deleteKey})`}
 				>
 					<Icon name="lucide:trash-2" class="w-3 h-3" />
-					Delete
+					<span class="flex-1">Delete</span>
 				</button>
 			</div>
 			{/if}
@@ -483,11 +559,14 @@
 			{onMenuToggle}
 			{expandedFolders}
 			{hasClipboard}
+			{canPaste}
+			{cutPaths}
 			{modifiedFiles}
 			{activeFilePath}
 			{gitStatusMap}
 			{gitFolderStatusMap}
 			{selectedPaths}
+			{cursorPath}
 			{onClick}
 			{onNodeDragStart}
 			{onNodeDragOver}
@@ -496,7 +575,6 @@
 			{onNodeDragEnd}
 			{dropTargetPath}
 			{busyPaths}
-			{aiChangesSet}
 		/>
 	{/each}
 {/if}

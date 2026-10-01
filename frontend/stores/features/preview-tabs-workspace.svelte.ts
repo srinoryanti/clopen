@@ -30,10 +30,13 @@ import {
 } from '$frontend/components/preview/browser/core/tab-operations.svelte';
 import { browserCleanup } from '$frontend/components/preview/browser/core/cleanup.svelte';
 import { setInteractionProjectId } from '$frontend/components/preview/browser/core/interactions.svelte';
+import { currentScopeKey } from '$frontend/stores/features/worktrees.svelte';
 import { registerDock, getActiveWorkspaceProjectId } from '$frontend/stores/ui/project-workspace.svelte';
 import ws, { onWsReconnect } from '$frontend/utils/ws';
 import { debug } from '$shared/utils/logger';
 import type { DeviceSize, Rotation } from '$frontend/utils/preview-constants';
+import { sameTabTarget } from '$frontend/utils/preview-url';
+import { findLaunchSlot, resolveLandedUrl } from '$frontend/utils/preview-launch';
 
 /** Module-level tab manager — shared across BrowserPreview mounts. */
 export const previewTabManager: TabManager = createTabManager();
@@ -177,6 +180,33 @@ function setMcpActivity(backendTabId: string, label: string | null): void {
 }
 
 /**
+ * Backend tab ids whose page the server has frozen for want of an audience.
+ *
+ * Held here rather than in the panel for the same reason as the lock: the
+ * event lands whether or not the preview is mounted, and a tab's strip entry
+ * has to be able to say "this page is asleep" the moment the user looks —
+ * otherwise a suspended page is indistinguishable from a running one that has
+ * simply stopped changing.
+ */
+let sleepingBackendIds = $state(new Set<string>());
+
+export function getSleepingBackendIds(): ReadonlySet<string> {
+	return sleepingBackendIds;
+}
+
+export function isBackendTabSleeping(backendTabId: string | null): boolean {
+	return !!backendTabId && sleepingBackendIds.has(backendTabId);
+}
+
+function setBackendTabSleeping(backendTabId: string, sleeping: boolean): void {
+	if (sleeping === sleepingBackendIds.has(backendTabId)) return;
+	const next = new Set(sleepingBackendIds);
+	if (sleeping) next.add(backendTabId);
+	else next.delete(backendTabId);
+	sleepingBackendIds = next;
+}
+
+/**
  * Backend tab ids whose page is showing something full screen.
  *
  * Held here, not in the panel, for the same reason as the lock state: the
@@ -219,6 +249,17 @@ interface TabSnapshotSlot {
 	rotation: Rotation;
 	sessionId: string | null;
 	isActive: boolean;
+	/**
+	 * Whether this slot had a backend tab on the way when the snapshot was
+	 * taken.
+	 *
+	 * A launch is a round-trip: the backend creates the tab and only then
+	 * hands back its id. Switching project in that window snapshots the slot
+	 * with no `sessionId` — and the tab the backend went on to create is then
+	 * recovered on the way back as a second, unrelated tab. Recording the
+	 * launch is what lets the two be recognised as one.
+	 */
+	launching?: boolean;
 }
 
 /** Slice restored from the workspace blob, consumed by the next load(). */
@@ -270,6 +311,7 @@ function materializeBackendTab(backendTab: ExistingTabInfo): string {
  * ring and the pointer on screen for the rest of the session.
  */
 function adoptBackendMcpState(backendTab: ExistingTabInfo): void {
+	setBackendTabSleeping(backendTab.tabId, !!backendTab.isSleeping);
 	setMcpControlled(backendTab.tabId, !!backendTab.isMcpControlled);
 	setMcpFocused(backendTab.tabId, !!backendTab.isMcpFocused);
 	setMcpActivity(backendTab.tabId, backendTab.isMcpControlled ? (backendTab.mcpActivity ?? null) : null);
@@ -305,6 +347,9 @@ export function reconcileMcpState(backendTabs: ExistingTabInfo[]): void {
 	for (const tabId of Object.keys(mcpActivityByBackendId)) {
 		if (!seen.has(tabId)) setMcpActivity(tabId, null);
 	}
+	for (const tabId of [...sleepingBackendIds]) {
+		if (!seen.has(tabId)) setBackendTabSleeping(tabId, false);
+	}
 }
 
 /** Re-create a blank (session-less) tab slot from a persisted snapshot. */
@@ -322,10 +367,10 @@ function materializeBlankTab(slot: TabSnapshotSlot): string {
  * Rebuild the singleton tab-list for `projectId` by reconciling the persisted
  * snapshot (slot order + blank tabs) with the backend's live sessions.
  */
-async function reconcileTabs(projectId: string): Promise<void> {
+async function reconcileTabs(projectId: string, scopeKey: string): Promise<void> {
 	let backendTabs: ExistingTabInfo[] = [];
 	try {
-		const result = await getExistingTabs(projectId);
+		const result = await getExistingTabs(scopeKey);
 		if (result && result.count > 0) {
 			backendTabs = result.tabs;
 			debug.log('preview', `✅ [dock load] Found ${result.count} backend tabs for project ${projectId}`);
@@ -361,6 +406,25 @@ async function reconcileTabs(projectId: string): Promise<void> {
 				if (slot.isActive) activeFrontendId = frontendId;
 				else if (backendTab.isActive) backendActiveFrontendId ??= frontendId;
 			} else {
+				// A slot whose launch was still in flight owns whichever backend
+				// tab that launch produced. Claimed by address, and only for a
+				// slot that was actually launching, so a blank tab the user had
+				// merely typed a URL into is never folded into someone else's.
+				const launched = slot.launching
+					? backendTabs.find(
+							(candidate) =>
+								!usedBackendIds.has(candidate.tabId) && sameTabTarget(slot.url, candidate.url)
+						)
+					: undefined;
+
+				if (launched) {
+					usedBackendIds.add(launched.tabId);
+					const frontendId = materializeBackendTab(launched);
+					if (slot.isActive) activeFrontendId = frontendId;
+					else if (launched.isActive) backendActiveFrontendId ??= frontendId;
+					continue;
+				}
+
 				const frontendId = materializeBlankTab(slot);
 				if (slot.isActive) activeFrontendId = frontendId;
 			}
@@ -388,7 +452,7 @@ async function reconcileTabs(projectId: string): Promise<void> {
 		previewTabManager.switchTab(activeFrontendId);
 		const activeTab = previewTabManager.getTab(activeFrontendId);
 		if (activeTab?.sessionId) {
-			await switchToBackendTab(activeTab.sessionId, projectId);
+			await switchToBackendTab(activeTab.sessionId, scopeKey);
 		}
 	}
 }
@@ -420,7 +484,8 @@ registerDock({
 			deviceSize: tab.deviceSize,
 			rotation: tab.rotation,
 			sessionId: tab.sessionId,
-			isActive: tab.id === activeTabId
+			isActive: tab.id === activeTabId,
+			launching: !tab.sessionId && !!tab.isLaunchingBrowser
 		}));
 	},
 	restore(slice) {
@@ -431,7 +496,7 @@ registerDock({
 		// Update the interactions module's projectId so any subsequent sends use it.
 		setInteractionProjectId(projectId);
 
-		await reconcileTabs(projectId);
+		await reconcileTabs(projectId, currentScopeKey() || projectId);
 
 		// Authoritative seeding: when neither snapshot nor backend produced any
 		// tabs, drop a single empty tab while the panel still shows its loading
@@ -465,12 +530,16 @@ registerDock({
  * Unstamped events (older backend / no projectId) are accepted so we never drop
  * legitimate events we can't attribute.
  */
+/**
+ * Events carry a workspace scope key, not a bare project id — a worktree's tabs
+ * must not reach a viewer sitting on the main tree of the same project.
+ */
 function isEventForActiveProject(data: { projectId?: string } | null | undefined): boolean {
 	const eventProjectId = data?.projectId;
 	if (!eventProjectId) return true;
-	const activeProjectId = getActiveWorkspaceProjectId();
-	if (!activeProjectId) return true;
-	return eventProjectId === activeProjectId;
+	const activeScope = currentScopeKey() || getActiveWorkspaceProjectId();
+	if (!activeScope) return true;
+	return eventProjectId === activeScope;
 }
 
 let tabSyncInitialized = false;
@@ -498,7 +567,8 @@ export function initPreviewTabSync(): void {
 		if (!projectId) return;
 
 		debug.log('preview', '🔁 [dock] Reconnected — re-reading agent state from backend');
-		void getExistingTabs(projectId).then((result) => {
+		const scopeKey = currentScopeKey() || projectId;
+		void getExistingTabs(scopeKey).then((result) => {
 			// A project switch may have landed while this was in flight; its own
 			// load() is authoritative and must not be overwritten by this answer.
 			if (getActiveWorkspaceProjectId() !== projectId) return;
@@ -522,11 +592,13 @@ export function initPreviewTabSync(): void {
 			return;
 		}
 
-		// A tab the frontend is launching (user typed a URL) is awaiting its
-		// backend session — link this event to it instead of creating a duplicate.
-		const launchingTab = previewTabManager.tabs.find((t) => t.isLaunchingBrowser && !t.sessionId);
+		// The slot that started this launch, named when the request went out.
+		const launchingTab = findLaunchSlot(previewTabManager.tabs, data.launchId);
 		if (launchingTab) {
 			debug.log('preview', `🔗 [dock] Linking launching tab ${launchingTab.id} → backend ${data.tabId}`);
+
+			const landed = data.url && data.url !== 'about:blank';
+
 			previewTabManager.updateTab(launchingTab.id, {
 				sessionId: data.tabId,
 				sessionInfo: {
@@ -535,8 +607,8 @@ export function initPreviewTabSync(): void {
 					deviceSize: data.deviceSize,
 					rotation: data.rotation
 				},
-				url: data.url,
-				title: data.title,
+				url: resolveLandedUrl(data.url, launchingTab.url),
+				title: landed ? data.title : launchingTab.title || data.title,
 				deviceSize: data.deviceSize || 'laptop',
 				rotation: data.rotation || 'landscape',
 				isConnected: true,
@@ -594,6 +666,7 @@ export function initPreviewTabSync(): void {
 		// The tab itself is gone, so unlike a release there is nothing left for a
 		// remembered pointer position to be about.
 		forgetMcpCursor(data.tabId);
+		setBackendTabSleeping(data.tabId, false);
 
 		// Backend-driven close (e.g. MCP) left zero tabs → reseed an empty one so
 		// the panel doesn't render as a void.
@@ -709,4 +782,32 @@ export function initPreviewTabSync(): void {
 		if (!isEventForActiveProject(data)) return;
 		setBackendTabFullscreen(data.tabId, !!data.active);
 	});
+
+	// The server froze a page nobody was watching, or woke one because someone
+	// is. Registered with the dock rather than the panel so the strip is right
+	// even for a tab that fell asleep while the preview was closed.
+	ws.on('preview:browser-tab-lifecycle' as any, (data: any) => {
+		if (!isEventForActiveProject(data)) return;
+		setBackendTabSleeping(data.tabId, !!data.sleeping);
+	});
 }
+
+/**
+ * Rebuild the tab list for the workspace now on screen.
+ *
+ * A worktree switch keeps the same project, so the dock's own load never fires
+ * — but the tabs belong to the tree, not the project, and must be re-read.
+ */
+export async function reloadPreviewTabsForScope(projectId: string, scopeKey: string): Promise<void> {
+	previewTabManager.clearAllTabs();
+	browserCleanup.clearAll();
+	restoredSnapshot = null;
+	setInteractionProjectId(projectId);
+
+	await reconcileTabs(projectId, scopeKey);
+
+	if (previewTabManager.getAllTabs().length === 0) {
+		previewTabManager.createTab('');
+	}
+}
+

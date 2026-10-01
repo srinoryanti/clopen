@@ -23,6 +23,7 @@ import type {
 	SuccessResultEvent,
 	ErrorResultEvent,
 	SystemInitEvent,
+	McpServerStatus,
 	RateLimitEvent,
 	RateLimitType,
 	NotificationEvent,
@@ -39,11 +40,13 @@ import { snapshotService } from '../snapshot/snapshot-service';
 import { snapshotQueries } from '../database/queries/snapshot-queries';
 import { projectContextService, refreshExpiringExternalOAuth } from '../mcp';
 import { resolveActiveProfileId } from '../profiles';
+import { expandSlashInvocation } from '../skills';
 import { browserMcpControl } from '../preview';
 import { extractMessageText } from '../snapshot/helpers';
 import { deferEpisodicIngest, ingestTurn } from '../memory/extract';
 import { buildMemoryContext, withMemoryContext } from '../memory/context';
 import { buildEngineHandoff, resolveBranchEngine, withHandoff } from './engine-handoff';
+import { resolveGitEnv } from '$backend/git/identity';
 import { debug } from '$shared/utils/logger';
 import { DEFAULT_MODEL_ID, DEFAULT_MODEL_NAME } from '$shared/constants/engines';
 
@@ -59,6 +62,12 @@ export interface StreamState {
 	processId: string;
 	engine: EngineType;
 	accountId?: number;
+	/**
+	 * Server-trusted id of the requesting user (see StreamRequest). Carried
+	 * through so terminal lifecycle events can fan out Web Push to the right
+	 * devices without trusting any client-supplied field.
+	 */
+	requestedByUserId?: string;
 	/** Reasoning/thinking level token for this run (native per engine; undefined = engine default). */
 	reasoningEffort?: string;
 	status: 'active' | 'completed' | 'error' | 'cancelled';
@@ -350,6 +359,7 @@ class StreamManager extends EventEmitter {
 			streamId: streamState.streamId,
 			projectId: streamState.projectId,
 			chatSessionId: streamState.chatSessionId,
+			requestedByUserId: streamState.requestedByUserId,
 			timestamp: (streamState.completedAt || new Date()).toISOString(),
 			reason
 		});
@@ -396,6 +406,7 @@ class StreamManager extends EventEmitter {
 			processId,
 			engine: request.engine.type,
 			accountId: request.engine.account?.id || undefined,
+			requestedByUserId: request.requestedByUserId,
 			reasoningEffort: request.reasoningEffort ?? undefined,
 			status: 'active',
 			startedAt: new Date(),
@@ -546,12 +557,15 @@ class StreamManager extends EventEmitter {
 		// engine initialization. It MUST finish before the engine can write any files
 		// (awaited just before streamQuery below) — otherwise early writes would be
 		// folded into the baseline and silently dropped from this turn's checkpoint.
+		// Re-taken every turn (see SnapshotService.beginTurn): a baseline carried
+		// over from the previous turn charged every idle-time change to this one.
 		let baselineInitPromise: Promise<void> | null = null;
-		if (requestData.projectPath && requestData.chatSessionId) {
-			baselineInitPromise = snapshotService.initializeSessionBaseline(
+		if (requestData.projectPath && requestData.projectId && requestData.chatSessionId) {
+			baselineInitPromise = snapshotService.beginTurn(
 				requestData.projectPath,
+				requestData.projectId,
 				requestData.chatSessionId
-			).catch(err => debug.error('snapshot', 'Failed to initialize session baseline:', err));
+			).catch(err => debug.error('snapshot', 'Failed to begin snapshot turn:', err));
 		}
 
 		try {
@@ -688,6 +702,39 @@ class StreamManager extends EventEmitter {
 			// is prepended to the ENGINE prompt only — `userMessage` (already saved
 			// above) stays clean, so the transcript never reaches the timeline.
 			let enginePrompt = userMessage;
+
+			// ── Slash skill expansion ──
+			// `/review-pr 123` is resolved HERE, not by the engine. Four of the eight
+			// engines have no native command directory at all, so the old per-engine
+			// materialization delivered nothing but a name to them; expanding once,
+			// centrally, is what makes a slash skill behave the same everywhere and
+			// lets `uses:` pull in several skills deterministically. The SAVED user
+			// message keeps the `/slug` the user typed — only the engine prompt is
+			// rewritten, exactly like the handoff and memory blocks below.
+			try {
+				const firstText = enginePrompt.content.find(block => block.type === 'text');
+				if (firstText?.type === 'text') {
+					const expanded = await expandSlashInvocation(firstText.text, { profileId: activeProfileId });
+					if (expanded) {
+						enginePrompt = {
+							...enginePrompt,
+							content: enginePrompt.content.map(block =>
+								block === firstText ? { ...block, text: expanded.text } : block
+							)
+						};
+						debug.log(
+							'chat',
+							`Expanded /${expanded.slug} into the engine prompt` +
+							(expanded.used.length ? ` (requires: ${expanded.used.join(', ')})` : '')
+						);
+					}
+				}
+			} catch (error) {
+				// A failed expansion must not block the turn — the engine simply
+				// receives the message exactly as the user typed it.
+				debug.warn('chat', 'Slash skill expansion failed, sending the message as typed:', error);
+			}
+
 			if (engineSwitched && chatSessionId) {
 				try {
 					const handoff = buildEngineHandoff(
@@ -847,6 +894,13 @@ class StreamManager extends EventEmitter {
 				...(projectId && chatSessionId && {
 					mcpContext: { projectId, chatSessionId, streamId: streamState.streamId, ...(activeProfileId != null && { profileId: activeProfileId }) }
 				}),
+				// The agent commits as the person who asked it to. Resolved here
+				// because this is the only layer that knows both the project and
+				// the requester; omitted when either is missing, which leaves git
+				// behaving exactly as it did before identities existed.
+				...(projectId && streamState.requestedByUserId && {
+					gitIdentityEnv: resolveGitEnv(projectId, streamState.requestedByUserId)
+				}),
 			});
 
 			await projectContextService.runWithContextAsync(
@@ -855,6 +909,12 @@ class StreamManager extends EventEmitter {
 				if ((streamState.status as string) === 'cancelled' || streamState.abortController?.signal.aborted) {
 					break;
 				}
+
+				// Every output, not only tool calls: the gap before a call is when an
+				// engine that reports commands after the fact actually ran them. This
+				// is how a snapshot tells this chat's writes from another chat's in
+				// the same folder, for any tool (see snapshot/turn-activity.ts).
+				if (chatSessionId) snapshotService.observeEngineOutput(chatSessionId, output);
 
 				// ── Route by type discriminant ──────────────────────────────
 
@@ -878,14 +938,14 @@ class StreamManager extends EventEmitter {
 						// Suppress the toast for "soft" statuses: `pending` (still
 						// connecting) and `needs-auth` (server expects OAuth/credentials
 						// configured in Settings → MCP). These are not errors — a scary
-						// toast for them is confusing. (Status is the raw SDK string,
-						// wider than the EngineOutput union, hence the cast.)
-						const SOFT_STATUSES = new Set(['pending', 'needs-auth']);
+						// toast for them is confusing. `pending` is the common case since
+						// claude-agent-sdk 0.3.282 connects MCP servers in the background.
+						const SOFT_STATUSES = new Set<McpServerStatus['status']>(['pending', 'needs-auth']);
 						const failedServers = initEvent.mcpServers.filter(
-							s => s.status !== 'connected' && !SOFT_STATUSES.has(s.status as string)
+							s => s.status !== 'connected' && !SOFT_STATUSES.has(s.status)
 						);
 						initEvent.mcpServers
-							.filter(s => SOFT_STATUSES.has(s.status as string))
+							.filter(s => SOFT_STATUSES.has(s.status))
 							.forEach(s => debug.log('mcp', `MCP server "${s.name}" not ready (${s.status}) — suppressing toast`));
 						failedServers.forEach(server => {
 							debug.warn('mcp', `MCP server connection failed: ${server.name} (${server.status})`);
@@ -1338,7 +1398,7 @@ class StreamManager extends EventEmitter {
 						return null;
 					})
 					.then(delta => {
-						void ingestTurn({
+						ingestTurn({
 							projectId,
 							projectPath,
 							sessionId: chatSessionId,
@@ -1347,6 +1407,10 @@ class StreamManager extends EventEmitter {
 							deletedPaths: delta?.deleted ?? []
 						});
 					});
+			} else if (chatSessionId) {
+				// No user message was saved, so there is nothing to capture against —
+				// but the turn was opened and must not stay "running".
+				void snapshotService.endTurn(chatSessionId);
 			}
 		}
 	}
@@ -1895,6 +1959,10 @@ class StreamManager extends EventEmitter {
 	 * Used when a session is deleted to remove green/amber status indicators.
 	 */
 	async cleanupSessionStreams(chatSessionId: string): Promise<void> {
+		// Session-scoped state held elsewhere (e.g. the composer's drafts and
+		// message queue) is released through this event.
+		this.emit('session:cleanup', chatSessionId);
+
 		const streamsToCancel: string[] = [];
 		const streamsToClean: string[] = [];
 

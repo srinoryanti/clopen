@@ -4,6 +4,7 @@
 	import Icon from '$frontend/components/common/display/Icon.svelte';
 	import Modal from '../overlay/Modal.svelte';
 	import Dialog from '../overlay/Dialog.svelte';
+	import { naturalCompare } from '$shared/utils/compare';
 	import { debug } from '$shared/utils/logger';
 	import ws from '$frontend/utils/ws';
 	import { getFileIcon } from '$frontend/utils/file-icon-mappings';
@@ -244,18 +245,10 @@
 			debug.warn('session', 'Failed to get current directory');
 		}
 
-		// Platform-specific fallback
-		if (typeof window !== 'undefined') {
-			if (navigator.userAgent.includes('Windows')) {
-				return 'C:\\';
-			} else {
-				// Unix-like systems (Linux, macOS, etc.)
-				return '/';
-			}
-		}
-
-		// Final fallback
-		return '/';
+		// No hardcoded drive/root here: open the drives list so the user can
+		// pick a folder from any available drive (C:, D:, …) or mount point.
+		// The project path is always saved and shown exactly as browsed.
+		return 'drives';
 	}
 
 	// Check if a folder path is a recent project
@@ -368,7 +361,7 @@
 						if (a.type !== b.type) {
 							return a.type === 'directory' ? -1 : 1;
 						}
-						return a.name.localeCompare(b.name);
+						return naturalCompare(a.name, b.name);
 					});
 			} else {
 				items = [];

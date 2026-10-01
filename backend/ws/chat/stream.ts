@@ -10,13 +10,43 @@
 import { t } from 'elysia';
 import { createRouter } from '$shared/utils/ws-server';
 import { streamManager, type StreamEvent } from '../../chat/stream-manager';
-import type { EngineType, UnifiedMessage } from '$shared/types/unified';
+import type { EngineType, StreamRequest, UnifiedMessage } from '$shared/types/unified';
 import { debug } from '$shared/utils/logger';
 import { trimSubAgentForWire } from '$shared/utils/subagent-wire-trim';
 import { ws } from '$backend/utils/ws';
 import { broadcastPresence } from '../projects/status';
-import { sessionQueries, messageQueries } from '../../database/queries';
+import { projectQueries, sessionQueries, messageQueries } from '../../database/queries';
+import { sendPushToUser } from '../../push/sender';
+import { chatStreamPushTag, waitingInputPushTag } from '../../push/tags';
+import {
+	chatNotificationMessage,
+	type ChatNotificationContext
+} from '$shared/constants/notification-messages';
 import { requireSessionAccess } from '../access';
+import { resolveSessionPath } from '../../worktrees';
+
+/**
+ * Where a notification-worthy event happened, resolved once on the server.
+ *
+ * The browser cannot do this itself: the sessions store only holds the project
+ * currently open, and these notifications exist precisely for the chats the
+ * user is *not* looking at. Shipping the resolved names in the event payload
+ * also keeps the tab's local toast worded identically to the server push that
+ * replaces it — they share a tag, so any difference would read as the
+ * notification rewriting itself.
+ *
+ * Missing rows yield `undefined`, never a placeholder: the composer drops an
+ * absent segment, which says more than the word "Unknown" did.
+ */
+function resolveNotificationContext(
+	projectId: string,
+	chatSessionId: string | undefined
+): ChatNotificationContext {
+	return {
+		projectName: projectQueries.getById(projectId)?.name || undefined,
+		sessionTitle: chatSessionId ? sessionQueries.getById(chatSessionId)?.title || undefined : undefined
+	};
+}
 
 /**
  * Broadcast presence + notify project members when a chat message may flip the
@@ -51,12 +81,31 @@ function handleWaitingInputChange(
 
 	// Notify all project members when AskUserQuestion arrives (sound + push)
 	if (askToolUse && projectId) {
+		const context = resolveNotificationContext(projectId, chatSessionId);
+
 		ws.emit.projectMembers(projectId, 'chat:waiting-input', {
 			projectId,
 			chatSessionId,
 			toolUseId: askToolUse.id,
-			timestamp: event.data?.timestamp || new Date().toISOString()
+			timestamp: event.data?.timestamp || new Date().toISOString(),
+			...context
 		});
+
+		// Background route: reach the requester's devices even when Chrome is
+		// closed. Deterministic tag replaces (not stacks with) the local toast
+		// the open tab shows for the same question.
+		const requestedByUserId = streamManager.getSessionStream(
+			chatSessionId,
+			projectId
+		)?.requestedByUserId;
+		if (requestedByUserId) {
+			void sendPushToUser(requestedByUserId, {
+				...chatNotificationMessage('waiting-input', context),
+				tag: waitingInputPushTag(askToolUse.id)
+			}).catch((error) => {
+				debug.warn('notification', 'Background waiting-input push failed:', error);
+			});
+		}
 	}
 }
 
@@ -67,8 +116,8 @@ function handleWaitingInputChange(
 // exists (e.g., after browser refresh when user is on a different project).
 // Ensures cross-project notifications (presence update, sound, push) always work.
 // ============================================================================
-streamManager.on('stream:lifecycle', (event: { status: string; streamId: string; projectId?: string; chatSessionId?: string; timestamp: string; reason?: string }) => {
-	const { status, projectId, chatSessionId, timestamp, reason } = event;
+streamManager.on('stream:lifecycle', (event: { status: string; streamId: string; projectId?: string; chatSessionId?: string; requestedByUserId?: string; timestamp: string; reason?: string }) => {
+	const { status, streamId, projectId, chatSessionId, requestedByUserId, timestamp, reason } = event;
 	if (!projectId) return;
 
 	debug.log('chat', `Stream lifecycle: ${status} for project ${projectId} session ${chatSessionId}${reason ? ` (reason: ${reason})` : ''}`);
@@ -82,14 +131,38 @@ streamManager.on('stream:lifecycle', (event: { status: string; streamId: string;
 		}
 	}
 
+	// Resolved once and shared: the payload below carries it to the open tab,
+	// and the background push below that reuses the very same values, so the
+	// two copies of one event cannot word themselves differently.
+	const context = resolveNotificationContext(projectId, chatSessionId);
+
 	// Notify all project members (cross-project notification for sound + push)
 	ws.emit.projectMembers(projectId, 'chat:stream-finished', {
 		projectId,
 		chatSessionId: chatSessionId || '',
+		streamId,
 		status: status as 'completed' | 'error' | 'cancelled',
 		timestamp,
-		reason
+		reason,
+		...context
 	});
+
+	// Background route: the open tab notifies locally via the WS event above;
+	// this reaches the requester's devices when Chrome is closed. The shared
+	// deterministic tag means an open tab's local toast is replaced, never
+	// duplicated. Never throws — chat completion must not depend on push.
+	if (requestedByUserId && reason !== 'session-deleted') {
+		// `cancelled` gets its own title. Filing it under a "complete" heading
+		// with an "interrupted" body made the notification contradict itself.
+		const notificationEvent =
+			status === 'error' ? 'error' : status === 'cancelled' ? 'cancelled' : 'completed';
+		void sendPushToUser(requestedByUserId, {
+			...chatNotificationMessage(notificationEvent, context),
+			tag: chatStreamPushTag(streamId)
+		}).catch((error) => {
+			debug.warn('notification', 'Background stream-finished push failed:', error);
+		});
+	}
 
 	// Broadcast updated presence (status indicators for all projects)
 	broadcastPresence().catch((err) => {
@@ -105,17 +178,197 @@ streamManager.on('snapshot:captured', (event: { projectId: string; chatSessionId
 	ws.emit.projectMembers(projectId, 'snapshot:captured', { projectId, chatSessionId });
 });
 
-// In-memory store for latest chat input state per chat session (keyed by chatSessionId)
-const chatSessionInputState = new Map<string, { text: string; senderId: string; attachments?: any[] }>();
-
-// In-memory store for edit mode state per chat session (keyed by chatSessionId)
-const chatSessionEditMode = new Map<string, { isEditing: boolean; messageId: string | null; messageTimestamp: string | null }>();
-
 // In-memory store for model state per chat session (keyed by chatSessionId)
-const chatSessionModelState = new Map<string, { engine: string; provider: string; modelId: string; modelName: string; senderId: string }>();
+const chatSessionModelState = new Map<string, { engine: string; provider: string; modelId: string; modelName: string; reasoningEffort?: string | null; senderId: string }>();
 
 // In-memory store for account state per chat session (keyed by chatSessionId)
 const chatSessionAccountState = new Map<string, { accountId: number | null; senderId: string }>();
+
+/**
+ * Forward one stream's events to its chat session room until the stream ends.
+ *
+ * Every path that attaches a stream to the room goes through here — the
+ * sender's own request, a client re-attaching after a refresh, and a queued
+ * message the server starts on its own — so the event wire format exists once.
+ * Returns the unsubscribe; a terminal event unsubscribes by itself.
+ */
+export function bridgeStreamToRoom(
+	streamId: string,
+	chatSessionId: string,
+	projectId: string | undefined,
+	options: { presenceOnConnection?: boolean } = {}
+): () => void {
+	const { presenceOnConnection = true } = options;
+
+	const handleStreamEvent = (event: StreamEvent) => {
+		try {
+			switch (event.type) {
+				case 'connection':
+					ws.emit.chatSession(chatSessionId, 'chat:connection', {
+						chatSessionId,
+						processId: event.data.processId,
+						timestamp: event.data.timestamp,
+						seq: event.seq
+					});
+					if (presenceOnConnection) {
+						broadcastPresence().catch((err) => {
+							debug.warn('chat', 'Presence broadcast error on stream connection event:', err);
+						});
+					}
+					break;
+
+				case 'message': {
+					ws.emit.chatSession(chatSessionId, 'chat:message', {
+						chatSessionId,
+						processId: event.processId,
+						message: trimSubAgentForWire(event.data.message),
+						usage: event.data.usage,
+						timestamp: event.data.timestamp,
+						message_id: event.data.message_id,
+						parent_message_id: event.data.parent_message_id,
+						sender_id: event.data.sender_id,
+						sender_name: event.data.sender_name,
+						engine: event.data.engine,
+						seq: event.seq
+					});
+					// Broadcast presence + notify when waiting-input state may change
+					handleWaitingInputChange(event, chatSessionId, projectId);
+					break;
+				}
+
+				case 'partial':
+					ws.emit.chatSession(chatSessionId, 'chat:partial', {
+						chatSessionId,
+						processId: event.processId,
+						eventType: event.data.eventType as any,
+						partialText: event.data.partialText || '',
+						deltaText: event.data.deltaText || '',
+						...(event.data.reasoning && { reasoning: true }),
+						timestamp: event.data.timestamp,
+						seq: event.seq
+					});
+					break;
+
+				case 'notification':
+					ws.emit.chatSession(chatSessionId, 'chat:notification', {
+						notification: event.data.notification,
+						timestamp: event.data.timestamp,
+						seq: event.seq
+					});
+					break;
+
+				case 'rate_limit':
+					ws.emit.chatSession(chatSessionId, 'chat:rate_limit', {
+						chatSessionId: event.data.chatSessionId,
+						engine: event.data.engine,
+						accountId: event.data.accountId,
+						status: event.data.status,
+						utilization: event.data.utilization,
+						resetsAt: event.data.resetsAt,
+						rateLimitType: event.data.rateLimitType ?? null,
+						timestamp: event.data.timestamp,
+						seq: event.seq
+					});
+					break;
+
+				case 'complete':
+					ws.emit.chatSession(chatSessionId, 'chat:complete', {
+						chatSessionId,
+						processId: event.processId,
+						timestamp: event.data.timestamp,
+						seq: event.seq
+					});
+					// Cross-project notifications (stream-finished, presence) are handled
+					// by the global stream:lifecycle listener at the module level.
+					unsubscribe();
+					break;
+
+				case 'error':
+					ws.emit.chatSession(chatSessionId, 'chat:error', {
+						chatSessionId,
+						processId: event.processId,
+						error: event.data.error,
+						timestamp: event.data.timestamp,
+						seq: event.seq
+					});
+					unsubscribe();
+					break;
+
+				case 'cancelled':
+					ws.emit.chatSession(chatSessionId, 'chat:error', {
+						chatSessionId,
+						processId: event.processId,
+						error: 'Stream cancelled',
+						timestamp: event.data.timestamp,
+						seq: event.seq
+					});
+					unsubscribe();
+					break;
+			}
+		} catch (err) {
+			// Log but do NOT unsubscribe — one bad event must not kill the
+			// entire stream subscription. The bridge between StreamManager
+			// and the WS room would be permanently broken, causing the UI
+			// to stop receiving stream output while the WS stays connected.
+			debug.error('chat', 'Error handling stream event:', err);
+		}
+	};
+
+	const unsubscribe = streamManager.subscribeToStream(streamId, handleStreamEvent);
+	return unsubscribe;
+}
+
+/**
+ * Start a chat turn and announce it to the session room. Shared by a client's
+ * `chat:stream` and the server-side message queue. Failures are reported to the
+ * room as `chat:error` and resolve to null — the caller has nothing to attach.
+ */
+export async function startChatStream(request: StreamRequest): Promise<string | null> {
+	// The client's projectPath is a view preference; the session's worktree is
+	// the fact. Resolving server-side is what keeps an isolated session from
+	// writing into the main tree when the two disagree.
+	const workingRoot = resolveSessionPath(request.chatSessionId, request.projectPath);
+
+	try {
+		debug.log('chat', 'Starting chat stream:', {
+			chatSessionId: request.chatSessionId,
+			projectId: request.projectId,
+			workingRoot
+		});
+
+		const streamId = await streamManager.startStream({ ...request, projectPath: workingRoot });
+		debug.log('chat', 'Stream started with ID:', streamId);
+
+		// The connection event from startStream() fires before anyone subscribes,
+		// so it is announced here. The user message reaches the room through the
+		// bridge (it carries resume, sender info and the saved message id).
+		const stream = streamManager.getStream(streamId);
+		if (stream) {
+			ws.emit.chatSession(request.chatSessionId, 'chat:connection', {
+				chatSessionId: request.chatSessionId,
+				processId: stream.processId,
+				timestamp: stream.startedAt.toISOString(),
+				seq: 1
+			});
+		}
+		broadcastPresence().catch((err) => {
+			debug.warn('chat', 'Presence broadcast error on chat stream start:', err);
+		});
+
+		return streamId;
+	} catch (error) {
+		const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+		debug.error('chat', 'Chat stream start error:', errorMessage);
+
+		ws.emit.chatSession(request.chatSessionId, 'chat:error', {
+			chatSessionId: request.chatSessionId,
+			processId: crypto.randomUUID(),
+			error: errorMessage,
+			timestamp: new Date().toISOString()
+		});
+		return null;
+	}
+}
 
 export const streamHandler = createRouter()
 	// Join a chat session room (subscribe to chat events for this session)
@@ -228,178 +481,32 @@ export const streamHandler = createRouter()
 		requireSessionAccess(conn, data.chatSessionId);
 		const projectId = ws.getProjectId(conn);
 
+		// The WS user id is server-trusted (unlike the client-supplied sender)
+		// and routes background Web Push to the requester's devices. Missing
+		// context must not break the stream — push is best-effort.
+		let requestedByUserId: string | undefined;
 		try {
-			debug.log('chat', 'WS chat:stream received:', {
-				chatSessionId: data.chatSessionId,
-				projectId
-			});
-
-			// Start background stream
-			const streamId = await streamManager.startStream({
-				projectPath: data.projectPath,
-				projectId,
-				prompt: data.prompt,
-				chatSessionId: data.chatSessionId,
-				engine: data.engine,
-				sender: data.sender,
-				profileId: data.profileId,
-				reasoningEffort: data.reasoningEffort
-			});
-
-			debug.log('chat', 'Stream started with ID:', streamId);
-
-			// Emit connection event to chat session room and broadcast presence immediately
-			// (the connection event from startStream() fires before subscription, so we emit it manually)
-			const stream = streamManager.getStream(streamId);
-			if (stream) {
-				ws.emit.chatSession(data.chatSessionId, 'chat:connection', {
-					chatSessionId: data.chatSessionId,
-					processId: stream.processId,
-					timestamp: stream.startedAt.toISOString(),
-					seq: 1
-				});
-				// User message is broadcast by stream-manager via event subscription below
-				// (includes resume, sender info, and saved message ID)
-			}
-			broadcastPresence().catch((err) => {
-				debug.warn('chat', 'Presence broadcast error on chat:stream start:', err);
-			});
-
-			// Subscribe to stream events (event-driven, no polling)
-			// Use ws.emit.chatSession() for session-scoped chat events
-			// Only users who joined this chat session room receive events
-			const chatSessionId = data.chatSessionId;
-			const handleStreamEvent = (event: StreamEvent) => {
-				try {
-					switch (event.type) {
-						case 'connection':
-							ws.emit.chatSession(chatSessionId, 'chat:connection', {
-								chatSessionId,
-								processId: event.data.processId,
-								timestamp: event.data.timestamp,
-								seq: event.seq
-							});
-							broadcastPresence().catch((err) => {
-								debug.warn('chat', 'Presence broadcast error on stream connection event:', err);
-							});
-							break;
-
-						case 'message': {
-							ws.emit.chatSession(chatSessionId, 'chat:message', {
-								chatSessionId,
-								processId: event.processId,
-								message: trimSubAgentForWire(event.data.message),
-								usage: event.data.usage,
-								timestamp: event.data.timestamp,
-								message_id: event.data.message_id,
-								parent_message_id: event.data.parent_message_id,
-								sender_id: event.data.sender_id,
-								sender_name: event.data.sender_name,
-								engine: event.data.engine,
-								seq: event.seq
-							});
-							// Broadcast presence + notify when waiting-input state may change
-							handleWaitingInputChange(event, chatSessionId, projectId);
-							break;
-						}
-
-						case 'partial':
-							ws.emit.chatSession(chatSessionId, 'chat:partial', {
-								chatSessionId,
-								processId: event.processId,
-								eventType: event.data.eventType as any,
-								partialText: event.data.partialText || '',
-								deltaText: event.data.deltaText || '',
-								...(event.data.reasoning && { reasoning: true }),
-								timestamp: event.data.timestamp,
-								seq: event.seq
-							});
-							break;
-
-						case 'notification':
-							ws.emit.chatSession(chatSessionId, 'chat:notification', {
-								notification: event.data.notification,
-								timestamp: event.data.timestamp,
-								seq: event.seq
-							});
-							break;
-
-						case 'rate_limit':
-							ws.emit.chatSession(chatSessionId, 'chat:rate_limit', {
-								chatSessionId: event.data.chatSessionId,
-								engine: event.data.engine,
-								accountId: event.data.accountId,
-								status: event.data.status,
-								utilization: event.data.utilization,
-								resetsAt: event.data.resetsAt,
-								rateLimitType: event.data.rateLimitType ?? null,
-								timestamp: event.data.timestamp,
-								seq: event.seq
-							});
-							break;
-
-						case 'complete':
-							ws.emit.chatSession(chatSessionId, 'chat:complete', {
-								chatSessionId,
-								processId: event.processId,
-								timestamp: event.data.timestamp,
-								seq: event.seq
-							});
-							// Cross-project notifications (stream-finished, presence) are handled
-							// by the global stream:lifecycle listener at the module level.
-							unsubscribe();
-							break;
-
-						case 'error':
-							ws.emit.chatSession(chatSessionId, 'chat:error', {
-								chatSessionId,
-								processId: event.processId,
-								error: event.data.error,
-								timestamp: event.data.timestamp,
-								seq: event.seq
-							});
-							// Cross-project notifications handled by stream:lifecycle listener
-							unsubscribe();
-							break;
-
-						case 'cancelled':
-							ws.emit.chatSession(chatSessionId, 'chat:error', {
-								chatSessionId,
-								processId: event.processId,
-								error: 'Stream cancelled',
-								timestamp: event.data.timestamp,
-								seq: event.seq
-							});
-							// Cross-project notifications handled by stream:lifecycle listener
-							unsubscribe();
-							break;
-					}
-				} catch (err) {
-					// Log but do NOT unsubscribe — one bad event must not kill the
-					// entire stream subscription. The bridge between StreamManager
-					// and the WS room would be permanently broken, causing the UI
-					// to stop receiving stream output while the WS stays connected.
-					debug.error('chat', 'Error handling stream event:', err);
-				}
-			};
-
-			// Subscribe to stream events
-			const unsubscribe = streamManager.subscribeToStream(streamId, handleStreamEvent);
-
-			// Register cleanup with WSServer (called automatically on connection close)
-			ws.addCleanup(conn, unsubscribe);
-
-		} catch (error) {
-			const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-			debug.error('chat', 'WS chat:stream error:', errorMessage);
-
-			ws.emit.chatSession(data.chatSessionId, 'chat:error', {
-				chatSessionId: data.chatSessionId,
-				processId: crypto.randomUUID(),
-				error: errorMessage,
-				timestamp: new Date().toISOString()
-			});
+			requestedByUserId = ws.getUserId(conn);
+		} catch {
+			requestedByUserId = undefined;
 		}
+
+		const streamId = await startChatStream({
+			projectPath: data.projectPath,
+			projectId,
+			chatSessionId: data.chatSessionId,
+			prompt: data.prompt,
+			engine: data.engine,
+			sender: data.sender,
+			profileId: data.profileId,
+			reasoningEffort: data.reasoningEffort,
+			requestedByUserId
+		});
+		if (!streamId) return;
+
+		// Tied to this connection: it closes with the connection, and the
+		// client's reconnect builds a new one.
+		ws.addCleanup(conn, bridgeStreamToRoom(streamId, data.chatSessionId, projectId));
 	})
 
 	// Reconnect to an active stream (after browser refresh / project switch)
@@ -422,118 +529,7 @@ export const streamHandler = createRouter()
 
 			debug.log('chat', 'Reconnecting to active stream:', streamState.streamId);
 
-			// Subscribe this connection to the stream's events (session-scoped)
-			const handleStreamEvent = (event: StreamEvent) => {
-				try {
-					switch (event.type) {
-						case 'connection':
-							ws.emit.chatSession(chatSessionId, 'chat:connection', {
-								chatSessionId,
-								processId: event.data.processId,
-								timestamp: event.data.timestamp,
-								seq: event.seq
-							});
-							break;
-
-						case 'message': {
-							ws.emit.chatSession(chatSessionId, 'chat:message', {
-								chatSessionId,
-								processId: event.processId,
-								message: trimSubAgentForWire(event.data.message),
-								usage: event.data.usage,
-								timestamp: event.data.timestamp,
-								message_id: event.data.message_id,
-								parent_message_id: event.data.parent_message_id,
-								sender_id: event.data.sender_id,
-								sender_name: event.data.sender_name,
-								engine: event.data.engine,
-								seq: event.seq
-							});
-							// Broadcast presence + notify when waiting-input state may change
-							handleWaitingInputChange(event, chatSessionId, projectId);
-							break;
-						}
-
-						case 'partial':
-							ws.emit.chatSession(chatSessionId, 'chat:partial', {
-								chatSessionId,
-								processId: event.processId,
-								eventType: event.data.eventType as any,
-								partialText: event.data.partialText || '',
-								deltaText: event.data.deltaText || '',
-								...(event.data.reasoning && { reasoning: true }),
-								timestamp: event.data.timestamp,
-								seq: event.seq
-							});
-							break;
-
-						case 'notification':
-							ws.emit.chatSession(chatSessionId, 'chat:notification', {
-								notification: event.data.notification,
-								timestamp: event.data.timestamp,
-								seq: event.seq
-							});
-							break;
-
-						case 'rate_limit':
-							ws.emit.chatSession(chatSessionId, 'chat:rate_limit', {
-								chatSessionId: event.data.chatSessionId,
-								engine: event.data.engine,
-								accountId: event.data.accountId,
-								status: event.data.status,
-								utilization: event.data.utilization,
-								resetsAt: event.data.resetsAt,
-								rateLimitType: event.data.rateLimitType ?? null,
-								timestamp: event.data.timestamp,
-								seq: event.seq
-							});
-							break;
-
-						case 'complete':
-							ws.emit.chatSession(chatSessionId, 'chat:complete', {
-								chatSessionId,
-								processId: event.processId,
-								timestamp: event.data.timestamp,
-								seq: event.seq
-							});
-							// Cross-project notifications handled by stream:lifecycle listener
-							unsubscribe();
-							break;
-
-						case 'error':
-							ws.emit.chatSession(chatSessionId, 'chat:error', {
-								chatSessionId,
-								processId: event.processId,
-								error: event.data.error,
-								timestamp: event.data.timestamp,
-								seq: event.seq
-							});
-							// Cross-project notifications handled by stream:lifecycle listener
-							unsubscribe();
-							break;
-
-						case 'cancelled':
-							ws.emit.chatSession(chatSessionId, 'chat:error', {
-								chatSessionId,
-								processId: event.processId,
-								error: 'Stream cancelled',
-								timestamp: event.data.timestamp,
-								seq: event.seq
-							});
-							// Cross-project notifications handled by stream:lifecycle listener
-							unsubscribe();
-							break;
-					}
-				} catch (err) {
-					// Log but do NOT unsubscribe — same rationale as the initial
-					// stream handler: a transient error must not permanently break
-					// the EventEmitter → WS room bridge.
-					debug.error('chat', 'Error handling reconnected stream event:', err);
-				}
-			};
-
-			const unsubscribe = streamManager.subscribeToStream(streamState.streamId, handleStreamEvent);
-			ws.addCleanup(conn, unsubscribe);
+			ws.addCleanup(conn, bridgeStreamToRoom(streamState.streamId, chatSessionId, projectId, { presenceOnConnection: false }));
 
 			// Send current state snapshot to chat session room so frontend can catch up
 			ws.emit.chatSession(chatSessionId, 'chat:connection', {
@@ -707,114 +703,6 @@ export const streamHandler = createRouter()
 		}
 	})
 
-	// Collaborative edit mode - broadcast and store edit mode state per chat session
-	.on('chat:edit-mode', {
-		data: t.Object({
-			senderId: t.String(),
-			chatSessionId: t.String(),
-			isEditing: t.Boolean(),
-			messageId: t.Union([t.String(), t.Null()]),
-			messageTimestamp: t.Union([t.String(), t.Null()])
-		})
-	}, ({ data, conn }) => {
-		requireSessionAccess(conn, data.chatSessionId);
-		const chatSessionId = data.chatSessionId;
-
-		// Store on server for late joiners / refresh (keyed by chatSessionId)
-		if (data.isEditing && data.messageId) {
-			chatSessionEditMode.set(chatSessionId, {
-				isEditing: true,
-				messageId: data.messageId,
-				messageTimestamp: data.messageTimestamp
-			});
-		} else {
-			chatSessionEditMode.delete(chatSessionId);
-		}
-
-		ws.emit.chatSession(chatSessionId, 'chat:edit-mode', {
-			senderId: data.senderId,
-			isEditing: data.isEditing,
-			messageId: data.messageId,
-			messageTimestamp: data.messageTimestamp
-		});
-	})
-
-	// Get current edit mode state for a chat session (for refresh / late joiners)
-	.http('chat:get-edit-mode', {
-		data: t.Object({
-			chatSessionId: t.Optional(t.String())
-		}),
-		response: t.Object({
-			isEditing: t.Boolean(),
-			messageId: t.Union([t.String(), t.Null()]),
-			messageTimestamp: t.Union([t.String(), t.Null()])
-		})
-	}, ({ data, conn }) => {
-		const chatSessionId = data.chatSessionId || '';
-		if (chatSessionId) {
-			requireSessionAccess(conn, chatSessionId);
-		}
-		const editState = chatSessionEditMode.get(chatSessionId);
-		return editState || { isEditing: false, messageId: null, messageTimestamp: null };
-	})
-
-	// Collaborative input sync - broadcast typing/attachments to other users in the same chat session
-	.on('chat:input-sync', {
-		data: t.Object({
-			text: t.String(),
-			senderId: t.String(),
-			chatSessionId: t.String(),
-			attachments: t.Optional(t.Array(t.Object({
-				id: t.String(),
-				fileName: t.String(),
-				type: t.String(),
-				mediaType: t.String(),
-				base64: t.String()
-			})))
-		})
-	}, ({ data, conn }) => {
-		requireSessionAccess(conn, data.chatSessionId);
-		const chatSessionId = data.chatSessionId;
-
-		// Store latest input state on server for late-joining users (keyed by chatSessionId)
-		chatSessionInputState.set(chatSessionId, {
-			text: data.text,
-			senderId: data.senderId,
-			attachments: data.attachments
-		});
-
-		ws.emit.chatSession(chatSessionId, 'chat:input-sync', {
-			text: data.text,
-			senderId: data.senderId,
-			attachments: data.attachments
-		});
-	})
-
-	// Get latest input state for a chat session (for users switching sessions)
-	.http('chat:get-input-state', {
-		data: t.Object({
-			chatSessionId: t.Optional(t.String())
-		}),
-		response: t.Object({
-			text: t.String(),
-			senderId: t.String(),
-			attachments: t.Optional(t.Array(t.Object({
-				id: t.String(),
-				fileName: t.String(),
-				type: t.String(),
-				mediaType: t.String(),
-				base64: t.String()
-			})))
-		})
-	}, ({ data, conn }) => {
-		const chatSessionId = data.chatSessionId || '';
-		if (chatSessionId) {
-			requireSessionAccess(conn, chatSessionId);
-		}
-		const state = chatSessionInputState.get(chatSessionId);
-		return state || { text: '', senderId: '' };
-	})
-
 	// Collaborative model sync - broadcast model changes to other users in the same chat session
 	.on('chat:model-sync', {
 		data: t.Object({
@@ -823,7 +711,13 @@ export const streamHandler = createRouter()
 			engine: t.String(),
 			provider: t.String(),
 			modelId: t.String(),
-			modelName: t.String()
+			modelName: t.String(),
+			// The reasoning level travels with the model pick (it is re-seeded per
+			// model), so collaborators never end up on a level the model lacks.
+			reasoningEffort: t.Optional(t.Union([t.String(), t.Null()])),
+			// Per-tab id of the sender; lets the sender drop its own echo without
+			// also dropping the same user's other tabs/devices.
+			clientId: t.Optional(t.String())
 		})
 	}, ({ data, conn }) => {
 		requireSessionAccess(conn, data.chatSessionId);
@@ -835,6 +729,7 @@ export const streamHandler = createRouter()
 			provider: data.provider,
 			modelId: data.modelId,
 			modelName: data.modelName,
+			reasoningEffort: data.reasoningEffort,
 			senderId: data.senderId
 		});
 
@@ -842,6 +737,9 @@ export const streamHandler = createRouter()
 		// so refreshes and late joiners get the correct model
 		try {
 			sessionQueries.updateEngineModel(chatSessionId, data.engine, data.provider, data.modelId, data.modelName);
+			if (data.reasoningEffort !== undefined) {
+				sessionQueries.updateReasoning(chatSessionId, data.reasoningEffort);
+			}
 		} catch (err) {
 			debug.error('chat', 'Failed to persist model sync to DB:', err);
 		}
@@ -849,10 +747,13 @@ export const streamHandler = createRouter()
 		// Broadcast to all users in the same chat session
 		ws.emit.chatSession(chatSessionId, 'chat:model-sync', {
 			senderId: data.senderId,
+			clientId: data.clientId,
+			chatSessionId,
 			engine: data.engine,
 			provider: data.provider,
 			modelId: data.modelId,
-			modelName: data.modelName
+			modelName: data.modelName,
+			reasoningEffort: data.reasoningEffort
 		});
 	})
 
@@ -862,7 +763,8 @@ export const streamHandler = createRouter()
 			senderId: t.String(),
 			chatSessionId: t.String(),
 			accountId: t.Union([t.Number(), t.Null()]),
-			accountName: t.Optional(t.Union([t.String(), t.Null()]))
+			accountName: t.Optional(t.Union([t.String(), t.Null()])),
+			clientId: t.Optional(t.String())
 		})
 	}, ({ data, conn }) => {
 		requireSessionAccess(conn, data.chatSessionId);
@@ -884,6 +786,8 @@ export const streamHandler = createRouter()
 		// Broadcast to all users in the same chat session
 		ws.emit.chatSession(chatSessionId, 'chat:account-sync', {
 			senderId: data.senderId,
+			clientId: data.clientId,
+			chatSessionId,
 			accountId: data.accountId,
 			accountName: data.accountName ?? null
 		});
@@ -896,7 +800,8 @@ export const streamHandler = createRouter()
 		data: t.Object({
 			senderId: t.String(),
 			chatSessionId: t.String(),
-			reasoningEffort: t.Union([t.String(), t.Null()])
+			reasoningEffort: t.Union([t.String(), t.Null()]),
+			clientId: t.Optional(t.String())
 		})
 	}, ({ data, conn }) => {
 		requireSessionAccess(conn, data.chatSessionId);
@@ -912,6 +817,8 @@ export const streamHandler = createRouter()
 		// Broadcast to all users in the same chat session
 		ws.emit.chatSession(chatSessionId, 'chat:reasoning-sync', {
 			senderId: data.senderId,
+			clientId: data.clientId,
+			chatSessionId,
 			reasoningEffort: data.reasoningEffort
 		});
 	})
@@ -923,7 +830,8 @@ export const streamHandler = createRouter()
 		data: t.Object({
 			senderId: t.String(),
 			chatSessionId: t.String(),
-			profileId: t.Union([t.Number(), t.Null()])
+			profileId: t.Union([t.Number(), t.Null()]),
+			clientId: t.Optional(t.String())
 		})
 	}, ({ data, conn }) => {
 		requireSessionAccess(conn, data.chatSessionId);
@@ -934,52 +842,46 @@ export const streamHandler = createRouter()
 		}
 		ws.emit.chatSession(data.chatSessionId, 'chat:profile-sync', {
 			senderId: data.senderId,
+			clientId: data.clientId,
+			chatSessionId: data.chatSessionId,
 			profileId: data.profileId
 		});
 	})
 
 	// Event declarations
-	.emit('chat:edit-mode', t.Object({
-		senderId: t.String(),
-		isEditing: t.Boolean(),
-		messageId: t.Union([t.String(), t.Null()]),
-		messageTimestamp: t.Union([t.String(), t.Null()])
-	}))
-
-	.emit('chat:input-sync', t.Object({
-		text: t.String(),
-		senderId: t.String(),
-		attachments: t.Optional(t.Array(t.Object({
-			id: t.String(),
-			fileName: t.String(),
-			type: t.String(),
-			mediaType: t.String(),
-			base64: t.String()
-		}))),
-		chatSessionId: t.Optional(t.String())
-	}))
-
+	// The *-sync broadcasts carry chatSessionId so a listener can drop events
+	// for a session it has just switched away from, and the sender's per-tab
+	// clientId so only the sending tab ignores its own echo.
 	.emit('chat:model-sync', t.Object({
 		senderId: t.String(),
+		clientId: t.Optional(t.String()),
+		chatSessionId: t.String(),
 		engine: t.String(),
 		provider: t.String(),
 		modelId: t.String(),
-		modelName: t.String()
+		modelName: t.String(),
+		reasoningEffort: t.Optional(t.Union([t.String(), t.Null()]))
 	}))
 
 	.emit('chat:account-sync', t.Object({
 		senderId: t.String(),
+		clientId: t.Optional(t.String()),
+		chatSessionId: t.String(),
 		accountId: t.Union([t.Number(), t.Null()]),
 		accountName: t.Union([t.String(), t.Null()])
 	}))
 
 	.emit('chat:profile-sync', t.Object({
 		senderId: t.String(),
+		clientId: t.Optional(t.String()),
+		chatSessionId: t.String(),
 		profileId: t.Union([t.Number(), t.Null()])
 	}))
 
 	.emit('chat:reasoning-sync', t.Object({
 		senderId: t.String(),
+		clientId: t.Optional(t.String()),
+		chatSessionId: t.String(),
 		reasoningEffort: t.Union([t.String(), t.Null()])
 	}))
 
@@ -1078,19 +980,28 @@ export const streamHandler = createRouter()
 		timestamp: t.String()
 	}))
 
+	// `projectName` / `sessionTitle` are resolved server-side and carried here
+	// so the tab can word its local notification exactly like the background
+	// push that replaces it. Optional because either row may be gone, and
+	// because a tab left open across a server upgrade will not send them.
 	.emit('chat:stream-finished', t.Object({
 		projectId: t.String(),
 		chatSessionId: t.String(),
+		streamId: t.Optional(t.String()),
 		status: t.Union([t.Literal('completed'), t.Literal('error'), t.Literal('cancelled')]),
 		timestamp: t.String(),
-		reason: t.Optional(t.String())
+		reason: t.Optional(t.String()),
+		projectName: t.Optional(t.String()),
+		sessionTitle: t.Optional(t.String())
 	}))
 
 	.emit('chat:waiting-input', t.Object({
 		projectId: t.String(),
 		chatSessionId: t.String(),
 		toolUseId: t.String(),
-		timestamp: t.String()
+		timestamp: t.String(),
+		projectName: t.Optional(t.String()),
+		sessionTitle: t.Optional(t.String())
 	}))
 
 	.emit('snapshot:captured', t.Object({

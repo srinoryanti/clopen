@@ -3,7 +3,7 @@
  * High-level git operations built on top of executor and parser
  */
 
-import { execGit, isGitRepo, getGitRoot, type GitExecResult } from './git-executor';
+import { execGit, isGitRepo, getGitRoot, type GitExecResult, type GitIdentityEnv } from './git-executor';
 import { resolveBinary } from '../utils/cli';
 import { getCleanSpawnEnv } from '../utils/env';
 import {
@@ -14,7 +14,10 @@ import {
 	parseLog,
 	parseRemotes,
 	parseStashList,
-	parseConflictMarkers
+	parseConflictMarkers,
+	parseReflog,
+	parseUnmergedStages,
+	hasConflictMarkers
 } from './git-parser';
 import type {
 	GitStatus,
@@ -25,8 +28,14 @@ import type {
 	GitLogResult,
 	GitRemote,
 	GitStashEntry,
-	GitConflictFile
+	GitPushTarget,
+	GitConflictFile,
+	GitConflictKind,
+	GitConflictResolution,
+	GitOperationState,
+	GitReflogEntry
 } from '$shared/types/git';
+import { naturalCompare } from '$shared/utils/compare';
 import { debug } from '$shared/utils/logger';
 import {
 	assertSafeGitCommitMessage,
@@ -119,11 +128,46 @@ export class GitService {
 		}
 	}
 
+	/**
+	 * Stage everything. Git will happily record a conflicted file that still has
+	 * `<<<<<<<` in it as resolved, so we check first and refuse — committing the
+	 * markers is far more expensive to undo than this error is to read.
+	 */
 	async stageAll(cwd: string): Promise<void> {
+		const unresolved = await this.findFilesWithLeftoverMarkers(cwd);
+		if (unresolved.length > 0) {
+			const shown = unresolved.slice(0, 5).join(', ');
+			const rest = unresolved.length > 5 ? ` and ${unresolved.length - 5} more` : '';
+			throw new Error(
+				`Cannot stage everything: ${shown}${rest} still contain conflict markers. Resolve them first.`
+			);
+		}
 		const result = await execGit(['add', '-A'], cwd);
 		if (result.exitCode !== 0) {
 			throw new Error(`git add -A failed: ${result.stderr}`);
 		}
+	}
+
+	/** Unmerged paths whose working-tree text still has conflict markers in it. */
+	private async findFilesWithLeftoverMarkers(cwd: string): Promise<string[]> {
+		const unmerged = await this.getUnmergedPaths(cwd);
+		if (unmerged.length === 0) return [];
+
+		const { readFile } = await import('node:fs/promises');
+		const { join } = await import('node:path');
+		const offenders: string[] = [];
+
+		for (const filePath of unmerged) {
+			try {
+				const buffer = await readFile(join(cwd, filePath));
+				if (buffer.subarray(0, 8000).includes(0)) continue;
+				if (hasConflictMarkers(buffer.toString('utf-8'))) offenders.push(filePath);
+			} catch {
+				// Missing file (both-deleted) has no markers to leave behind.
+			}
+		}
+
+		return offenders;
 	}
 
 	async unstageFile(cwd: string, filePath: string): Promise<void> {
@@ -169,9 +213,27 @@ export class GitService {
 		}
 	}
 
+	/**
+	 * Discard every working-tree change.
+	 *
+	 * Refused during a conflict: `git checkout -- .` cannot restore an unmerged
+	 * path, so it would half-succeed — wiping the unrelated edits while leaving
+	 * the conflict in place — and the old code ignored both exit codes, so that
+	 * partial result was invisible. Unwinding a merge is `abortOperation`'s job.
+	 */
 	async discardAll(cwd: string): Promise<void> {
+		const unmerged = await this.getUnmergedPaths(cwd);
+		if (unmerged.length > 0) {
+			throw new Error(
+				'Cannot discard everything while a merge is unresolved. Abort the operation instead, or resolve the conflicts first.'
+			);
+		}
+
 		// Restore tracked files
-		await execGit(['checkout', '--', '.'], cwd);
+		const restore = await execGit(['checkout', '--', '.'], cwd);
+		if (restore.exitCode !== 0 && restore.stderr.trim()) {
+			throw new Error(`git checkout failed: ${restore.stderr.trim()}`);
+		}
 		// Remove untracked files
 		await execGit(['clean', '-fd'], cwd);
 	}
@@ -180,9 +242,18 @@ export class GitService {
 	// Commit
 	// ============================================
 
-	async commit(cwd: string, message: string): Promise<string> {
+	/**
+	 * Create a commit.
+	 *
+	 * `identityEnv` carries who is committing (see `backend/git/identity`). It is
+	 * threaded explicitly through the operations that create a git object or talk
+	 * to a remote, rather than resolved inside `execGit`, because resolving it
+	 * reads the database and the read-only commands run constantly. Anything
+	 * added here that writes an object or authenticates needs the same parameter.
+	 */
+	async commit(cwd: string, message: string, identityEnv: GitIdentityEnv = {}): Promise<string> {
 		assertSafeGitCommitMessage(message);
-		const result = await execGit(['commit', '-m', message], cwd);
+		const result = await execGit(['commit', '-m', message], cwd, { env: identityEnv });
 		if (result.exitCode !== 0) {
 			throw new Error(`git commit failed: ${result.stderr}`);
 		}
@@ -191,7 +262,7 @@ export class GitService {
 		return hashResult.stdout.trim();
 	}
 
-	async amendCommit(cwd: string, message?: string): Promise<string> {
+	async amendCommit(cwd: string, message?: string, identityEnv: GitIdentityEnv = {}): Promise<string> {
 		const args = ['commit', '--amend'];
 		if (message) {
 			assertSafeGitCommitMessage(message);
@@ -199,7 +270,7 @@ export class GitService {
 		} else {
 			args.push('--no-edit');
 		}
-		const result = await execGit(args, cwd);
+		const result = await execGit(args, cwd, { env: identityEnv });
 		if (result.exitCode !== 0) {
 			// Unborn HEAD — git says "You have nothing to amend", which reads like a
 			// failure rather than "commit normally instead".
@@ -297,7 +368,10 @@ export class GitService {
 		// where `HEAD` is `*` for the current branch and ` ` for others.
 		// `iso-date` is strict ISO 8601 so it can't collide with the `|`
 		// separators — the parser uses `lastIndexOf('|')` to extract it.
-		const localFmt = '%(HEAD)|%(refname:short)|%(objectname:short)|%(subject)|%(committerdate:iso8601)';
+		// `%1f` emits a literal 0x1F, which separates the upstream from the legacy
+		// pipe-delimited fields without colliding with a `|` inside a subject.
+		const localFmt =
+			'%(HEAD)|%(refname:short)|%(objectname:short)|%(subject)|%(committerdate:iso8601)%1f%(upstream:short)';
 		const remoteFmt = '%(refname:short)|%(objectname:short)|%(subject)|%(committerdate:iso8601)';
 		const [localResult, remoteResult, headRef] = await Promise.all([
 			execGit(['for-each-ref', `--format=${localFmt}`, 'refs/heads/'], cwd),
@@ -334,10 +408,35 @@ export class GitService {
 		branchInfo.current = headName;
 		for (const b of branchInfo.local) b.isCurrent = b.name === headName;
 
-		// Get ahead/behind for current branch relative to the SELECTED remote
-		if (branchInfo.current && selectedRemote) {
+		// Fill in upstreams that git cannot name. `gh pr checkout` on a fork PR
+		// writes the fork's URL into `branch.<name>.remote`, and a URL has no
+		// remote-tracking ref, so `%(upstream:short)` comes back empty even though
+		// the branch is very much tracking something.
+		for (const localBranch of branchInfo.local) {
+			if (localBranch.upstream) continue;
+			const configured = await this.readBranchTracking(cwd, localBranch.name);
+			if (configured) localBranch.upstream = `${configured.remote}/${configured.remoteBranch}`;
+		}
+
+		// Ahead/behind belongs against the branch's REAL upstream. Measuring it
+		// against `<selectedRemote>/<same name>` reported 0/0 whenever the branch
+		// tracked a differently-named branch or a different remote — which is
+		// exactly the fork-PR case.
+		const currentUpstream = branchInfo.local.find(b => b.isCurrent)?.upstream;
+		const trackingRef = currentUpstream
+			? // Tracks something. Use it when it resolves locally; when it does not —
+				// a URL upstream has no local ref — report nothing rather than compare
+				// against an unrelated same-named branch on the selected remote.
+				(await this.hasRef(cwd, currentUpstream))
+				? currentUpstream
+				: null
+			: selectedRemote
+				? `${selectedRemote}/${branchInfo.current}`
+				: null;
+
+		if (branchInfo.current && trackingRef) {
 			try {
-				const remoteRef = `${selectedRemote}/${branchInfo.current}`;
+				const remoteRef = trackingRef;
 				const abResult = await execGit(
 					['rev-list', '--left-right', '--count', `${branchInfo.current}...${remoteRef}`],
 					cwd
@@ -389,7 +488,7 @@ export class GitService {
 					})
 				);
 				// Stable order for the UI (sorted by relPath).
-				nestedResults.sort((a, b) => a.relPath.localeCompare(b.relPath));
+				nestedResults.sort((a, b) => naturalCompare(a.relPath, b.relPath));
 				branchInfo.nested = nestedResults;
 			}
 		} catch (err) {
@@ -446,21 +545,37 @@ export class GitService {
 		}
 	}
 
-	async deleteRemoteBranch(cwd: string, remote: string, branch: string): Promise<void> {
+	async deleteRemoteBranch(cwd: string, remote: string, branch: string, identityEnv: GitIdentityEnv = {}): Promise<void> {
 		assertSafeGitRevish(remote, 'remote name');
 		assertSafeGitRevish(branch, 'branch name');
-		const result = await execGit(['push', remote, '--delete', branch], cwd);
+		const result = await execGit(['push', remote, '--delete', branch], cwd, { env: identityEnv });
 		if (result.exitCode !== 0) {
 			throw new Error(`git push --delete failed: ${result.stderr}`);
 		}
 	}
 
-	async mergeBranch(cwd: string, branchName: string, noFastForward = false): Promise<{ success: boolean; message: string }> {
+	/**
+	 * Merge `branchName` into the current branch.
+	 *
+	 * The three mode flags are mutually exclusive in git, so the caller picks one:
+	 * `--no-ff` always records a merge commit, `--squash` collapses the branch into
+	 * staged changes without committing, `--ff-only` refuses anything that is not a
+	 * fast-forward.
+	 */
+	async mergeBranch(
+		cwd: string,
+		branchName: string,
+		options: { noFastForward?: boolean; squash?: boolean; ffOnly?: boolean } | boolean = false,
+		identityEnv: GitIdentityEnv = {}
+	): Promise<{ success: boolean; message: string }> {
 		assertSafeGitRevish(branchName, 'merge branch');
+		const opts = typeof options === 'boolean' ? { noFastForward: options } : options;
 		const args = ['merge'];
-		if (noFastForward) args.push('--no-ff');
+		if (opts.squash) args.push('--squash');
+		else if (opts.ffOnly) args.push('--ff-only');
+		else if (opts.noFastForward) args.push('--no-ff');
 		args.push(branchName);
-		const result = await execGit(args, cwd);
+		const result = await execGit(args, cwd, { timeout: 120000, env: identityEnv });
 		return {
 			success: result.exitCode === 0,
 			message: result.exitCode === 0 ? result.stdout : result.stderr
@@ -523,26 +638,41 @@ export class GitService {
 		return parseRemotes(result.stdout);
 	}
 
-	async fetch(cwd: string, remote = 'origin'): Promise<string> {
+	async fetch(cwd: string, remote = 'origin', identityEnv: GitIdentityEnv = {}): Promise<string> {
 		assertSafeGitRemoteName(remote);
 		// Use explicit refspec to ensure all branches are fetched regardless of clone config
-		const result = await execGit(['fetch', remote, `+refs/heads/*:refs/remotes/${remote}/*`, '--prune'], cwd, 60000);
+		const result = await execGit(['fetch', remote, `+refs/heads/*:refs/remotes/${remote}/*`, '--prune'], cwd, { timeout: 60000, env: identityEnv });
 		if (result.exitCode !== 0) {
 			throw new Error(`git fetch failed: ${result.stderr}`);
 		}
 		return result.stderr || result.stdout; // git fetch outputs to stderr
 	}
 
-	async pull(cwd: string, remote = 'origin', branch?: string, rebase = false): Promise<{ success: boolean; message: string }> {
-		assertSafeGitRemoteName(remote);
+	/**
+	 * Pull the current branch.
+	 *
+	 * Mirrors `push`: naming `<selectedRemote> <localName>` explicitly pulled from
+	 * the wrong place whenever the branch tracked a different remote or a
+	 * differently-named branch, which is the normal state of a fork PR under
+	 * review. A tracked branch pulls from its own upstream.
+	 */
+	async pull(cwd: string, remote = 'origin', branch?: string, rebase = false, identityEnv: GitIdentityEnv = {}): Promise<{ success: boolean; message: string }> {
 		const args = ['pull'];
 		if (rebase) args.push('--rebase');
-		args.push(remote);
-		if (branch) {
-			assertSafeGitRevish(branch, 'pull branch');
-			args.push(branch);
+
+		const target = await this.getPushTarget(cwd, branch);
+		if (!target.hasUpstream) {
+			assertSafeGitRemoteName(remote);
+			args.push(remote);
+			if (branch) {
+				assertSafeGitRevish(branch, 'pull branch');
+				args.push(branch);
+			}
 		}
-		const result = await execGit(args, cwd, 60000);
+
+		// A pull can create a merge commit, so it needs both halves of the
+		// identity: the credential to fetch, the name to author the merge.
+		const result = await execGit(args, cwd, { timeout: 60000, env: identityEnv });
 		return {
 			success: result.exitCode === 0,
 			message: result.exitCode === 0 ? result.stdout : result.stderr
@@ -564,10 +694,131 @@ export class GitService {
 		if (!(await this.hasCommits(cwd))) {
 			return { success: false, message: 'This branch has no commits yet, so there is nothing to push.' };
 		}
+		// `--force-with-lease` compares against the remote-tracking ref. A branch
+		// that tracks a bare URL — a fork PR checked out for review — has no such
+		// ref, so git refuses with a bare "stale info" that explains nothing.
+		if (/stale info/i.test(result.stderr)) {
+			return {
+				success: false,
+				message:
+					'Force push with lease needs a remote-tracking ref to compare against, and this branch does not have one (it tracks a URL rather than a named remote). Fetch the branch first, or use a plain force push.'
+			};
+		}
 		return { success: false, message: result.stderr };
 	}
 
-	async push(cwd: string, remote = 'origin', branch?: string, force = false): Promise<{ success: boolean; message: string }> {
+	/** Read a single git config value, or null when it is unset. */
+	private async readConfig(cwd: string, key: string): Promise<string | null> {
+		const result = await execGit(['config', '--get', key], cwd, { okExitCodes: [1] });
+		const value = result.stdout.trim();
+		return result.exitCode === 0 && value ? value : null;
+	}
+
+	/** True when `ref` resolves in this repo. */
+	private async hasRef(cwd: string, ref: string): Promise<boolean> {
+		if (!/^[^\0\n\r]+$/.test(ref) || ref.startsWith('-')) return false;
+		const result = await execGit(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], cwd, {
+			okExitCodes: [1]
+		});
+		return result.exitCode === 0;
+	}
+
+	/**
+	 * The tracking configuration recorded for a branch, straight from git config.
+	 *
+	 * Read from config rather than from `@{upstream}` on purpose: when
+	 * `branch.<name>.remote` holds a URL instead of a remote name — which is what
+	 * `gh pr checkout` writes for a fork PR — every ref-based lookup fails with
+	 * "not stored as a remote-tracking branch", even though the branch does track
+	 * something and a plain `git push` sends it to exactly the right place.
+	 */
+	private async readBranchTracking(
+		cwd: string,
+		branch: string
+	): Promise<{ remote: string; remoteBranch: string } | null> {
+		assertSafeGitRevish(branch, 'branch name');
+		const remote = await this.readConfig(cwd, `branch.${branch}.remote`);
+		const merge = await this.readConfig(cwd, `branch.${branch}.merge`);
+		if (!remote || !merge) return null;
+		return { remote, remoteBranch: merge.replace(/^refs\/heads\//, '') };
+	}
+
+	/** A remote name is a configured remote; anything else we treat as a URL. */
+	private async isConfiguredRemote(cwd: string, name: string): Promise<boolean> {
+		const result = await execGit(['remote'], cwd);
+		return result.stdout.split('\n').map(r => r.trim()).includes(name);
+	}
+
+	/**
+	 * Resolve where a push would actually land, following git's own precedence:
+	 * `branch.<name>.pushRemote` > `remote.pushDefault` > `branch.<name>.remote`.
+	 *
+	 * Used for display and to decide whether a push needs `-u`; the push itself
+	 * still delegates to git so nothing here can drift from what git does.
+	 */
+	async getPushTarget(cwd: string, branch?: string): Promise<GitPushTarget> {
+		const current = branch ?? (await execGit(['branch', '--show-current'], cwd)).stdout.trim();
+		const fallback: GitPushTarget = {
+			remote: 'origin',
+			remoteBranch: current,
+			hasUpstream: false,
+			isUrl: false,
+			branch: current
+		};
+		if (!current) return fallback;
+
+		const tracking = await this.readBranchTracking(cwd, current);
+		const pushRemote =
+			(await this.readConfig(cwd, `branch.${current}.pushRemote`)) ??
+			(await this.readConfig(cwd, 'remote.pushDefault')) ??
+			tracking?.remote ??
+			null;
+
+		if (!pushRemote) return fallback;
+
+		return {
+			remote: pushRemote,
+			// When pushing to a different remote than the branch fetches from, git's
+			// default `push.default=simple` uses the local name; otherwise it uses
+			// the configured merge ref.
+			remoteBranch:
+				tracking && pushRemote === tracking.remote ? tracking.remoteBranch : current,
+			hasUpstream: Boolean(tracking),
+			isUrl: !(await this.isConfiguredRemote(cwd, pushRemote)),
+			branch: current
+		};
+	}
+
+	/**
+	 * Push the current branch.
+	 *
+	 * When the branch already tracks something we run a bare `git push` and let
+	 * git resolve the destination. Naming a remote and a branch explicitly — which
+	 * this used to do unconditionally, with `-u` — sent a fork PR's review commits
+	 * into the main repository as a brand-new branch, and the `-u` then rewrote
+	 * the branch's remote so every subsequent push went there too.
+	 *
+	 * `remote`/`branch` are only used for the genuinely untracked case (the first
+	 * push of a new local branch), where a destination has to be chosen and `-u`
+	 * is what the user wants.
+	 */
+	async push(
+		cwd: string,
+		remote = 'origin',
+		branch?: string,
+		force = false,
+		options: { useUpstream?: boolean } = {},
+		identityEnv: GitIdentityEnv = {}
+	): Promise<{ success: boolean; message: string }> {
+		const { useUpstream = true } = options;
+		const target = await this.getPushTarget(cwd, branch);
+
+		if (useUpstream && target.hasUpstream) {
+			const args = ['push'];
+			if (force) args.push('--force-with-lease');
+			return this.describePushResult(cwd, await execGit(args, cwd, { timeout: 60000, env: identityEnv }));
+		}
+
 		assertSafeGitRemoteName(remote);
 		const args = ['push', remote];
 		if (branch) {
@@ -575,9 +826,38 @@ export class GitService {
 			args.push(branch);
 		}
 		if (force) args.push('--force-with-lease');
-		// Set upstream if needed
+		// Only safe here: the branch tracks nothing, so there is no upstream to
+		// overwrite and recording one is the point of a first push.
 		args.push('-u');
-		return this.describePushResult(cwd, await execGit(args, cwd, 60000));
+		return this.describePushResult(cwd, await execGit(args, cwd, { timeout: 60000, env: identityEnv }));
+	}
+
+	/** Point a branch at a different upstream — the way back from a wrong push. */
+	async setUpstream(
+		cwd: string,
+		branch: string,
+		remote: string,
+		remoteBranch?: string
+	): Promise<void> {
+		assertSafeGitRevish(branch, 'branch name');
+		assertSafeGitRemoteName(remote);
+		const target = remoteBranch ?? branch;
+		assertSafeGitRevish(target, 'upstream branch');
+		const result = await execGit(
+			['branch', `--set-upstream-to=${remote}/${target}`, branch],
+			cwd
+		);
+		if (result.exitCode !== 0) {
+			throw new Error(`Could not set upstream: ${result.stderr.trim() || 'unknown error'}`);
+		}
+	}
+
+	async unsetUpstream(cwd: string, branch: string): Promise<void> {
+		assertSafeGitRevish(branch, 'branch name');
+		const result = await execGit(['branch', '--unset-upstream', branch], cwd);
+		if (result.exitCode !== 0) {
+			throw new Error(`Could not clear upstream: ${result.stderr.trim() || 'unknown error'}`);
+		}
 	}
 
 	/**
@@ -591,28 +871,45 @@ export class GitService {
 		cwd: string,
 		mode: 'with-tags' | 'all-tags' | 'force-lease' | 'force',
 		remote = 'origin',
-		branch?: string
+		branch?: string,
+		identityEnv: GitIdentityEnv = {}
 	): Promise<{ success: boolean; message: string }> {
+		// `--tags` is about the tag namespace, not this branch, so it always needs
+		// an explicit remote.
+		if (mode === 'all-tags') {
+			assertSafeGitRemoteName(remote);
+			return this.describePushResult(
+				cwd,
+				await execGit(['push', remote, '--tags'], cwd, { timeout: 60000, env: identityEnv })
+			);
+		}
+
+		const flag =
+			mode === 'with-tags'
+				? '--follow-tags'
+				: mode === 'force-lease'
+					? '--force-with-lease'
+					: '--force';
+
+		// Same rule as `push`: a tracked branch goes where git says it goes.
+		const target = await this.getPushTarget(cwd, branch);
+		if (target.hasUpstream) {
+			return this.describePushResult(cwd, await execGit(['push', flag], cwd, { timeout: 60000, env: identityEnv }));
+		}
+
 		assertSafeGitRemoteName(remote);
 		const args = ['push', remote];
-		if (mode === 'all-tags') {
-			args.push('--tags');
-		} else {
-			if (branch) {
-				assertSafeGitRevish(branch, 'push branch');
-				args.push(branch);
-			}
-			if (mode === 'with-tags') args.push('--follow-tags');
-			else if (mode === 'force-lease') args.push('--force-with-lease');
-			else if (mode === 'force') args.push('--force');
-			args.push('-u');
+		if (branch) {
+			assertSafeGitRevish(branch, 'push branch');
+			args.push(branch);
 		}
-		return this.describePushResult(cwd, await execGit(args, cwd, 60000));
+		args.push(flag, '-u');
+		return this.describePushResult(cwd, await execGit(args, cwd, { timeout: 60000, env: identityEnv }));
 	}
 
 	/** Fetch every configured remote and prune deleted remote-tracking refs. */
-	async fetchAll(cwd: string): Promise<string> {
-		const result = await execGit(['fetch', '--all', '--prune', '--tags'], cwd, 60000);
+	async fetchAll(cwd: string, identityEnv: GitIdentityEnv = {}): Promise<string> {
+		const result = await execGit(['fetch', '--all', '--prune', '--tags'], cwd, { timeout: 60000, env: identityEnv });
 		if (result.exitCode !== 0) {
 			throw new Error(`git fetch --all failed: ${result.stderr}`);
 		}
@@ -668,7 +965,7 @@ export class GitService {
 		return parseStashList(result.stdout);
 	}
 
-	async stashSave(cwd: string, message?: string, stagedOnly = false): Promise<void> {
+	async stashSave(cwd: string, message?: string, stagedOnly = false, identityEnv: GitIdentityEnv = {}): Promise<void> {
 		const args = ['stash', 'push'];
 		// `--staged` stashes exactly the index (works at hunk level, so partially
 		// staged files are handled precisely). Requires Git >= 2.35.
@@ -677,7 +974,7 @@ export class GitService {
 			assertSafeGitCommitMessage(message);
 			args.push('-m', message);
 		}
-		const result = await execGit(args, cwd);
+		const result = await execGit(args, cwd, { env: identityEnv });
 		if (result.exitCode !== 0) {
 			// Git < 2.35 doesn't know `--staged`; surface an actionable message
 			// instead of the raw "unknown option" / "usage:" noise.
@@ -712,6 +1009,30 @@ export class GitService {
 				return { success: false, hasConflicts: true, message: result.stderr || result.stdout };
 			}
 			throw new Error(`git stash pop failed: ${result.stderr}`);
+		}
+		return { success: true, hasConflicts: false, message: result.stdout };
+	}
+
+	/**
+	 * Like `stashPop`, but leaves the entry in the stash list. Preferred when the
+	 * changes might not apply cleanly: a conflicted `pop` is easy to abort into a
+	 * state where the work looks lost, whereas `apply` always keeps a copy.
+	 */
+	async stashApply(
+		cwd: string,
+		index = 0
+	): Promise<{ success: boolean; hasConflicts: boolean; message: string }> {
+		if (!Number.isInteger(index) || index < 0) {
+			throw new Error('Invalid stash index');
+		}
+		const result = await execGit(['stash', 'apply', `stash@{${index}}`], cwd);
+		const combined = `${result.stdout}\n${result.stderr}`;
+		const hasConflicts = /CONFLICT \(/.test(combined) || /needs merge/.test(combined);
+		if (result.exitCode !== 0) {
+			if (hasConflicts) {
+				return { success: false, hasConflicts: true, message: result.stderr || result.stdout };
+			}
+			throw new Error(`git stash apply failed: ${result.stderr}`);
 		}
 		return { success: true, hasConflicts: false, message: result.stdout };
 	}
@@ -767,7 +1088,7 @@ export class GitService {
 		return tags;
 	}
 
-	async createTag(cwd: string, name: string, message?: string, commitHash?: string): Promise<void> {
+	async createTag(cwd: string, name: string, message?: string, commitHash?: string, identityEnv: GitIdentityEnv = {}): Promise<void> {
 		assertSafeGitRevish(name, 'tag name');
 		const args = ['tag'];
 		if (message) {
@@ -780,7 +1101,7 @@ export class GitService {
 			assertSafeGitRevish(commitHash, 'tag target');
 			args.push(commitHash);
 		}
-		const result = await execGit(args, cwd);
+		const result = await execGit(args, cwd, { env: identityEnv });
 		if (result.exitCode !== 0) {
 			throw new Error(`git tag failed: ${result.stderr}`);
 		}
@@ -794,10 +1115,10 @@ export class GitService {
 		}
 	}
 
-	async pushTag(cwd: string, name: string, remote = 'origin'): Promise<{ success: boolean; message: string }> {
+	async pushTag(cwd: string, name: string, remote = 'origin', identityEnv: GitIdentityEnv = {}): Promise<{ success: boolean; message: string }> {
 		assertSafeGitRemoteName(remote);
 		assertSafeGitRevish(name, 'tag name');
-		const result = await execGit(['push', remote, name], cwd, 60000);
+		const result = await execGit(['push', remote, name], cwd, { timeout: 60000, env: identityEnv });
 		return {
 			success: result.exitCode === 0,
 			message: result.exitCode === 0 ? (result.stderr || result.stdout) : result.stderr
@@ -808,54 +1129,184 @@ export class GitService {
 	// Conflict Resolution
 	// ============================================
 
+	/**
+	 * Working-tree text above this size is not shipped to the client. A conflicted
+	 * minified bundle can be tens of megabytes; reading it, holding it as a JS
+	 * string and pushing it down the WebSocket stalls the panel for no benefit,
+	 * since nobody resolves a 20 MB file marker-by-marker anyway.
+	 */
+	private static readonly MAX_CONFLICT_CONTENT_BYTES = 2 * 1024 * 1024;
+
+	/**
+	 * Classify a conflict from the stages present in the index. Git records up to
+	 * three: 1 = merge base, 2 = ours, 3 = theirs. A missing stage means that side
+	 * deleted (or never had) the path.
+	 */
+	private conflictKindFromStages(stages: Set<number>): GitConflictKind {
+		const base = stages.has(1);
+		const ours = stages.has(2);
+		const theirs = stages.has(3);
+
+		if (ours && theirs) return base ? 'both-modified' : 'both-added';
+		if (ours && !theirs) return base ? 'deleted-by-them' : 'added-by-us';
+		if (!ours && theirs) return base ? 'deleted-by-us' : 'added-by-them';
+		return 'both-deleted';
+	}
+
+	/**
+	 * List every unmerged path with enough context for the resolver to render it.
+	 *
+	 * The source of truth is `git ls-files -u`, not the working tree. Reading files
+	 * first (and dropping the ones that throw) silently hid whole classes of
+	 * conflict: both-deleted has no file on disk at all, so those paths vanished
+	 * from the UI while git still refused to continue.
+	 */
 	async getConflictFiles(cwd: string): Promise<GitConflictFile[]> {
-		const status = await this.getStatus(cwd);
+		const result = await execGit(['ls-files', '-u', '-z'], cwd);
+		if (result.exitCode !== 0) {
+			throw new Error(`git ls-files -u failed: ${result.stderr}`);
+		}
+
+		const stages = parseUnmergedStages(result.stdout);
+		const { readFile, stat } = await import('node:fs/promises');
+		const { join } = await import('node:path');
 		const conflicts: GitConflictFile[] = [];
 
-		for (const file of status.conflicted) {
+		for (const [filePath, fileStages] of stages) {
+			const kind = this.conflictKindFromStages(fileStages);
+			const entry: GitConflictFile = {
+				path: filePath,
+				content: '',
+				markers: [],
+				kind,
+				contentOmitted: true
+			};
+
 			try {
-				const { readFile } = await import('node:fs/promises');
-				const { join } = await import('node:path');
-				const content = await readFile(join(cwd, file.path), 'utf-8');
-				const markers = parseConflictMarkers(content);
-				conflicts.push({ path: file.path, content, markers });
-			} catch (err) {
-				debug.error('git', `Failed to read conflict file: ${file.path}`, err);
+				const info = await stat(join(cwd, filePath));
+				entry.size = info.size;
+				if (info.size > GitService.MAX_CONFLICT_CONTENT_BYTES) {
+					entry.omitReason = 'too-large';
+				} else {
+					const buffer = await readFile(join(cwd, filePath));
+					// A NUL in the head is git's own binary heuristic. Decoding such a
+					// file as UTF-8 produces replacement characters, and writing that
+					// back as a "resolution" would corrupt it.
+					if (buffer.subarray(0, 8000).includes(0)) {
+						entry.omitReason = 'binary';
+					} else {
+						entry.content = buffer.toString('utf-8');
+						entry.markers = parseConflictMarkers(entry.content);
+						entry.contentOmitted = false;
+					}
+				}
+			} catch {
+				// No working-tree file: both-deleted, or deleted-by-us before the user
+				// restored it. Still a conflict git needs an answer for.
+				entry.omitReason = 'missing';
 			}
+
+			conflicts.push(entry);
 		}
 
 		return conflicts;
 	}
 
+	/**
+	 * Apply one resolution to one conflicted path and stage the result.
+	 *
+	 * `ours`/`theirs` need the file to have that stage — `git checkout --ours` on a
+	 * path the other side deleted fails with an opaque "does not have our version",
+	 * so we translate those into the keep/delete answer git actually wants.
+	 */
 	async resolveConflict(
 		cwd: string,
 		filePath: string,
-		resolution: 'ours' | 'theirs' | 'custom',
+		resolution: GitConflictResolution,
 		customContent?: string
 	): Promise<void> {
 		assertSafeGitPathOperand(filePath, 'conflict path');
-		if (resolution === 'custom' && customContent !== undefined) {
-			// Write custom content
-			const { writeFile } = await import('node:fs/promises');
-			const { join } = await import('node:path');
-			await writeFile(join(cwd, filePath), customContent, 'utf-8');
-		} else if (resolution === 'ours') {
-			await execGit(['checkout', '--ours', '--', filePath], cwd);
-		} else if (resolution === 'theirs') {
-			await execGit(['checkout', '--theirs', '--', filePath], cwd);
+		const { writeFile, readFile } = await import('node:fs/promises');
+		const { join } = await import('node:path');
+		const absolute = join(cwd, filePath);
+
+		if (resolution === 'reset') {
+			// Re-materialize the conflict so the user can start over.
+			const reset = await execGit(['checkout', '--merge', '--', filePath], cwd);
+			if (reset.exitCode !== 0) {
+				throw new Error(`git checkout --merge failed: ${reset.stderr}`);
+			}
+			return;
 		}
 
-		// Stage the resolved file
+		if (resolution === 'delete') {
+			const removed = await execGit(['rm', '-f', '--', filePath], cwd);
+			if (removed.exitCode !== 0) {
+				throw new Error(`git rm failed: ${removed.stderr}`);
+			}
+			return;
+		}
+
+		if (resolution === 'custom') {
+			if (customContent === undefined) {
+				throw new Error('A custom resolution needs the resolved file content');
+			}
+			this.assertNoLeftoverMarkers(customContent, filePath);
+			await writeFile(absolute, customContent, 'utf-8');
+		} else if (resolution === 'ours' || resolution === 'theirs') {
+			const stages = parseUnmergedStages(
+				(await execGit(['ls-files', '-u', '-z', '--', filePath], cwd)).stdout
+			);
+			const present = stages.get(filePath) ?? new Set<number>();
+			const wanted = resolution === 'ours' ? 2 : 3;
+			if (!present.has(wanted)) {
+				// That side deleted the path — "take ours" means "stay deleted".
+				const removed = await execGit(['rm', '-f', '--', filePath], cwd);
+				if (removed.exitCode !== 0) {
+					throw new Error(`git rm failed: ${removed.stderr}`);
+				}
+				return;
+			}
+			const flag = resolution === 'ours' ? '--ours' : '--theirs';
+			const checkout = await execGit(['checkout', flag, '--', filePath], cwd);
+			if (checkout.exitCode !== 0) {
+				throw new Error(`git checkout ${flag} failed: ${checkout.stderr}`);
+			}
+		} else if (resolution === 'keep') {
+			// Keep whatever is on disk — but not if it still has markers in it.
+			try {
+				const buffer = await readFile(absolute);
+				if (!buffer.subarray(0, 8000).includes(0)) {
+					this.assertNoLeftoverMarkers(buffer.toString('utf-8'), filePath);
+				}
+			} catch (err) {
+				if (err instanceof Error && err.message.includes('conflict marker')) throw err;
+				throw new Error(`Cannot keep "${filePath}": the file is not in the working tree`);
+			}
+		}
+
 		await this.stageFile(cwd, filePath);
 	}
 
 	/**
-	 * Aborts the in-progress conflict-producing operation: merge, cherry-pick,
-	 * revert, rebase, or a stash pop that left unmerged paths. We detect the
-	 * type via `.git/*_HEAD` sentinel files and pick the matching abort command.
-	 * For stash conflicts (no sentinel) we fall back to `git reset --merge`,
-	 * which unwinds the unmerged paths while keeping unrelated local edits.
+	 * Refuse to stage text that still contains `<<<<<<<`. Git does not check this,
+	 * so without the guard a half-finished resolution commits the markers.
 	 */
+	private assertNoLeftoverMarkers(content: string, filePath: string): void {
+		if (hasConflictMarkers(content)) {
+			throw new Error(
+				`"${filePath}" still contains conflict markers. Remove every <<<<<<< / ======= / >>>>>>> block before staging it.`
+			);
+		}
+	}
+
+	/** Paths git still considers unmerged. */
+	async getUnmergedPaths(cwd: string): Promise<string[]> {
+		const result = await execGit(['diff', '--name-only', '--diff-filter=U', '-z'], cwd);
+		if (result.exitCode !== 0) return [];
+		return result.stdout.split('\0').filter(Boolean);
+	}
+
 	/** Resolve the absolute git dir for a working tree (handles worktrees/.git files). */
 	private async resolveGitDir(cwd: string): Promise<string> {
 		const { join } = await import('node:path');
@@ -883,7 +1334,177 @@ export class GitService {
 		return null;
 	}
 
-	async abortMerge(cwd: string): Promise<void> {
+	/** Short subject of a revision, or an empty string when it cannot be read. */
+	private async subjectOf(cwd: string, rev: string): Promise<string> {
+		const result = await execGit(['log', '-1', '--format=%s', rev], cwd);
+		return result.exitCode === 0 ? result.stdout.trim() : '';
+	}
+
+	/** Best human name for a commit-ish: a branch name if one points at it, else a short hash. */
+	private async describeRef(cwd: string, rev: string): Promise<string> {
+		const named = await execGit(
+			['name-rev', '--name-only', '--refs=refs/heads/*', '--refs=refs/remotes/*', rev],
+			cwd
+		);
+		const name = named.stdout.trim();
+		if (named.exitCode === 0 && name && name !== 'undefined') {
+			return name.replace(/^remotes\//, '');
+		}
+		const short = await execGit(['rev-parse', '--short', rev], cwd);
+		return short.exitCode === 0 ? short.stdout.trim() : rev;
+	}
+
+	/**
+	 * Everything the UI needs to describe and finish an in-progress operation.
+	 *
+	 * The `ours`/`theirs` labels matter more than they look: during a rebase git
+	 * replays your commit on top of the upstream, so `--ours` is the upstream and
+	 * `--theirs` is your own work — inverted relative to a merge. Surfacing the
+	 * raw words without the branch names is what makes people pick the wrong side.
+	 */
+	async getOperationState(cwd: string): Promise<GitOperationState> {
+		const { existsSync, readFileSync } = await import('node:fs');
+		const { join } = await import('node:path');
+		const gitDir = await this.resolveGitDir(cwd);
+		const readTrimmed = (...parts: string[]): string => {
+			const target = join(gitDir, ...parts);
+			try {
+				return existsSync(target) ? readFileSync(target, 'utf-8').trim() : '';
+			} catch {
+				return '';
+			}
+		};
+
+		const operation = await this.detectGitOperation(cwd);
+		const unmerged = await this.getUnmergedPaths(cwd);
+		const state: GitOperationState = {
+			operation,
+			oursLabel: 'ours',
+			theirsLabel: 'theirs',
+			unmergedCount: unmerged.length,
+			canContinue: false,
+			canSkip: false,
+			stashConflict: false
+		};
+
+		const currentBranch = (await execGit(['branch', '--show-current'], cwd)).stdout.trim();
+
+		if (operation === 'rebase') {
+			// Interactive/merge-backend rebases use rebase-merge; `git am`-style ones
+			// use rebase-apply. They spell the same counters differently.
+			const isMerge = existsSync(join(gitDir, 'rebase-merge'));
+			const dir = isMerge ? 'rebase-merge' : 'rebase-apply';
+			const step = Number(readTrimmed(dir, isMerge ? 'msgnum' : 'next'));
+			const total = Number(readTrimmed(dir, isMerge ? 'end' : 'last'));
+			if (Number.isInteger(step) && step > 0) state.step = step;
+			if (Number.isInteger(total) && total > 0) state.total = total;
+
+			const headName = readTrimmed(dir, 'head-name').replace(/^refs\/heads\//, '');
+			const onto = readTrimmed(dir, 'onto');
+			state.oursLabel = onto ? await this.describeRef(cwd, onto) : 'upstream';
+			state.theirsLabel = headName ? `your commit (${headName})` : 'your commit';
+
+			const stopped = readTrimmed(dir, 'stopped-sha') || readTrimmed(dir, 'original-commit');
+			if (stopped) state.currentCommit = await this.subjectOf(cwd, stopped);
+			state.canSkip = true;
+		} else if (operation === 'merge') {
+			state.oursLabel = currentBranch || 'current branch';
+			state.theirsLabel = await this.describeRef(cwd, 'MERGE_HEAD');
+			state.currentCommit = await this.subjectOf(cwd, 'MERGE_HEAD');
+		} else if (operation === 'cherry-pick' || operation === 'revert') {
+			const head = operation === 'cherry-pick' ? 'CHERRY_PICK_HEAD' : 'REVERT_HEAD';
+			state.oursLabel = currentBranch || 'current branch';
+			state.theirsLabel = await this.describeRef(cwd, head);
+			state.currentCommit = await this.subjectOf(cwd, head);
+			state.canSkip = true;
+		} else if (operation === null && unmerged.length > 0) {
+			// Unmerged paths with no sentinel: a stash pop/apply that conflicted.
+			state.stashConflict = true;
+			state.oursLabel = currentBranch || 'working tree';
+			state.theirsLabel = 'stashed changes';
+		}
+
+		// Bisect never has a "continue"; everything else is finishable once the
+		// index is clean.
+		state.canContinue =
+			operation !== null && operation !== 'bisect' && unmerged.length === 0;
+
+		return state;
+	}
+
+	/**
+	 * Finish the in-progress operation. Returns the git output instead of throwing
+	 * on failure, because the common failures here are instructions rather than
+	 * errors — "nothing to commit, use --skip" is something the user must read.
+	 */
+	async continueOperation(cwd: string, identityEnv: GitIdentityEnv = {}): Promise<{ success: boolean; message: string }> {
+		const operation = await this.detectGitOperation(cwd);
+		const unmerged = await this.getUnmergedPaths(cwd);
+		if (unmerged.length > 0) {
+			throw new Error(
+				`${unmerged.length} file${unmerged.length === 1 ? ' is' : 's are'} still unmerged. Resolve and stage them first.`
+			);
+		}
+
+		let args: string[];
+		switch (operation) {
+			case 'rebase':
+				args = ['rebase', '--continue'];
+				break;
+			case 'merge':
+				args = ['merge', '--continue'];
+				break;
+			case 'cherry-pick':
+				args = ['cherry-pick', '--continue'];
+				break;
+			case 'revert':
+				args = ['revert', '--continue'];
+				break;
+			default:
+				throw new Error('There is no operation to continue.');
+		}
+
+		const result = await execGit(args, cwd, { timeout: 120000, env: identityEnv });
+		return {
+			success: result.exitCode === 0,
+			message: (result.exitCode === 0 ? result.stdout : result.stderr).trim()
+		};
+	}
+
+	/** Drop the commit git is currently stuck on and move to the next one. */
+	async skipOperation(cwd: string, identityEnv: GitIdentityEnv = {}): Promise<{ success: boolean; message: string }> {
+		const operation = await this.detectGitOperation(cwd);
+		let args: string[];
+		switch (operation) {
+			case 'rebase':
+				args = ['rebase', '--skip'];
+				break;
+			case 'cherry-pick':
+				args = ['cherry-pick', '--skip'];
+				break;
+			case 'revert':
+				args = ['revert', '--skip'];
+				break;
+			default:
+				throw new Error('This operation cannot be skipped.');
+		}
+
+		const result = await execGit(args, cwd, { timeout: 120000, env: identityEnv });
+		return {
+			success: result.exitCode === 0,
+			message: (result.exitCode === 0 ? result.stdout : result.stderr).trim()
+		};
+	}
+
+	/**
+	 * Aborts the in-progress conflict-producing operation: merge, cherry-pick,
+	 * revert, rebase, or a stash pop that left unmerged paths. We detect the
+	 * type via `.git/*_HEAD` sentinel files and pick the matching abort command.
+	 * For stash conflicts (no sentinel) we fall back to `git reset --merge`,
+	 * which unwinds the unmerged paths while keeping unrelated local edits — the
+	 * stash entry itself survives a failed pop, so nothing is actually lost.
+	 */
+	async abortOperation(cwd: string): Promise<void> {
 		const { existsSync } = await import('node:fs');
 		const { join } = await import('node:path');
 
@@ -897,19 +1518,84 @@ export class GitService {
 		else if (has('rebase-merge') || has('rebase-apply')) args = ['rebase', '--abort'];
 
 		if (args) {
-			const result = await execGit(args, cwd);
+			const result = await execGit(args, cwd, 120000);
 			if (result.exitCode !== 0) {
 				throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`);
 			}
 			return;
 		}
 
-		// No standard in-progress operation — likely a stash pop conflict. Use
-		// `git reset --merge` to unwind unmerged paths safely.
 		const reset = await execGit(['reset', '--merge'], cwd);
 		if (reset.exitCode !== 0) {
 			throw new Error(`git reset --merge failed: ${reset.stderr}`);
 		}
+	}
+
+	/** Back-compat alias — the panel called this before rebase/cherry-pick were handled. */
+	async abortMerge(cwd: string): Promise<void> {
+		return this.abortOperation(cwd);
+	}
+
+	/**
+	 * Rebase the current branch onto `upstream`.
+	 *
+	 * `--autostash` is on by default: without it git refuses to start whenever the
+	 * working tree is dirty, which from the panel just looks like the button not
+	 * working.
+	 */
+	async rebaseOnto(
+		cwd: string,
+		upstream: string,
+		autostash = true,
+		identityEnv: GitIdentityEnv = {}
+	): Promise<{ success: boolean; hasConflicts: boolean; message: string }> {
+		assertSafeGitRevish(upstream, 'rebase upstream');
+		const args = ['rebase'];
+		if (autostash) args.push('--autostash');
+		args.push(upstream);
+
+		const result = await execGit(args, cwd, { timeout: 120000, env: identityEnv });
+		const combined = `${result.stdout}\n${result.stderr}`;
+		const hasConflicts = /CONFLICT \(/.test(combined) || /could not apply/i.test(combined);
+		if (result.exitCode !== 0 && !hasConflicts) {
+			throw new Error(`git rebase failed: ${result.stderr || result.stdout}`);
+		}
+		return {
+			success: result.exitCode === 0,
+			hasConflicts,
+			message: (result.exitCode === 0 ? result.stdout : result.stderr || result.stdout).trim()
+		};
+	}
+
+	/** Restore the HEAD position recorded before the last checkout. */
+	async returnToBranch(cwd: string, branch?: string): Promise<void> {
+		if (branch) {
+			await this.switchBranch(cwd, branch);
+			return;
+		}
+		// `-` is git's own "previous checkout" shorthand, which is exactly what the
+		// user wants after inspecting a commit from the history view.
+		const result = await execGit(['checkout', '-'], cwd);
+		if (result.exitCode !== 0) {
+			throw new Error(
+				`Could not return to the previous branch: ${result.stderr.trim() || 'no previous checkout recorded'}`
+			);
+		}
+	}
+
+	/** Read the repo's undo journal — the only way back from a bad reset or rebase. */
+	async getReflog(cwd: string, limit = 100): Promise<GitReflogEntry[]> {
+		const SEPARATOR = '|||';
+		const format = `%H${SEPARATOR}%h${SEPARATOR}%gd${SEPARATOR}%gs${SEPARATOR}%cI`;
+		const result = await execGit(
+			['reflog', `--format=${format}`, `--max-count=${Math.max(1, Math.min(limit, 500))}`],
+			cwd
+		);
+		if (result.exitCode !== 0) {
+			if (!(await this.hasCommits(cwd))) return [];
+			throw new Error(`git reflog failed: ${result.stderr}`);
+		}
+		return parseReflog(result.stdout);
 	}
 
 	// ============================================
@@ -974,9 +1660,9 @@ export class GitService {
 	}
 
 	/** Create a new commit that reverses a previous one (default: HEAD). */
-	async revertCommit(cwd: string, ref = 'HEAD'): Promise<{ success: boolean; message: string }> {
+	async revertCommit(cwd: string, ref = 'HEAD', identityEnv: GitIdentityEnv = {}): Promise<{ success: boolean; message: string }> {
 		assertSafeGitRevish(ref, 'revert ref');
-		const result = await execGit(['revert', '--no-edit', ref], cwd);
+		const result = await execGit(['revert', '--no-edit', ref], cwd, { env: identityEnv });
 		if (result.exitCode !== 0 && !(await this.hasCommits(cwd))) {
 			// Unborn HEAD — git only reports `bad revision 'HEAD'`.
 			return { success: false, message: 'This repository has no commits yet, so there is nothing to revert.' };
@@ -988,14 +1674,14 @@ export class GitService {
 	}
 
 	/** Cherry-pick one or more commits onto the current branch (`git cherry-pick <hash>...`). */
-	async cherryPick(cwd: string, refs: string[]): Promise<{ success: boolean; message: string }> {
+	async cherryPick(cwd: string, refs: string[], identityEnv: GitIdentityEnv = {}): Promise<{ success: boolean; message: string }> {
 		if (refs.length === 0) {
 			return { success: false, message: 'No commits provided' };
 		}
 		for (const ref of refs) {
 			assertSafeGitRevish(ref, 'cherry-pick ref');
 		}
-		const result = await execGit(['cherry-pick', ...refs], cwd);
+		const result = await execGit(['cherry-pick', ...refs], cwd, { env: identityEnv });
 		return {
 			success: result.exitCode === 0,
 			message: result.exitCode === 0 ? (result.stdout || result.stderr || 'Cherry-pick succeeded') : result.stderr
@@ -1035,17 +1721,21 @@ export class GitService {
 	 */
 	async npmVersion(
 		cwd: string,
-		bump: 'patch' | 'minor' | 'major'
+		bump: 'patch' | 'minor' | 'major',
+		identityEnv: GitIdentityEnv = {}
 	): Promise<{ success: boolean; version: string; message: string }> {
 		const npmPath = resolveBinary('npm');
 		if (!npmPath) {
 			throw new Error('npm binary not found on PATH');
 		}
+		// npm runs git itself for the bump commit and tag, so the identity has to
+		// travel in the environment — there is no `execGit` call here to attach it
+		// to, and this is precisely why the mechanism is environment-based.
 		const proc = Bun.spawn([npmPath, 'version', bump], {
 			cwd,
 			stdout: 'pipe',
 			stderr: 'pipe',
-			env: { ...getCleanSpawnEnv() }
+			env: { ...getCleanSpawnEnv(), ...identityEnv }
 		});
 		const [stdout, stderr] = await Promise.all([
 			new Response(proc.stdout).text(),

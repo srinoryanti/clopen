@@ -14,11 +14,13 @@
  * - cleanup.ts: Admin cleanup endpoints (status, perform)
  * - webcodecs.ts: WebCodecs streaming handlers
  * - native-ui.ts: Native UI handlers (dialogs, print, select, context menu)
+ * - data.ts: Browsing data (list sites, clear one or all)
  * - mcp.ts: MCP tab coordination response handlers
  * - host.ts: Viewer-answered capabilities (geolocation, camera, clipboard, files)
  *
  * Available endpoints:
  * - preview:browser-tab-open - Open new browser tab (with optional URL)
+ * - preview:browser-tab-open-cancel - Stop a launch that has no tab yet
  * - preview:browser-tab-close - Close browser tab
  * - preview:browser-tab-navigate - Navigate tab to new URL
  * - preview:browser-tab-history-go - Walk the tab's history (back/forward)
@@ -31,6 +33,8 @@
  * - preview:browser-console-clear - Clear console logs
  * - preview:browser-console-execute - Execute console command
  * - preview:browser-console-toggle - Toggle console logging
+ * - preview:browser-data-list - List sites the workspace profile holds data for
+ * - preview:browser-data-clear - Clear one site's data, or all of it
  * - preview:browser-cleanup-status - Get cleanup status
  * - preview:browser-cleanup-perform - Perform cleanup
  * - preview:browser-stream-start - Start streaming
@@ -48,6 +52,7 @@ import { tabInfoPreviewHandler } from './browser/tab-info';
 import { statsPreviewHandler } from './browser/stats';
 import { consolePreviewHandler } from './browser/console';
 import { cleanupPreviewHandler } from './browser/cleanup';
+import { browsingDataPreviewHandler } from './browser/data';
 import { streamPreviewHandler } from './browser/webcodecs';
 import { nativeUIPreviewHandler } from './browser/native-ui';
 import { mcpPreviewHandler } from './browser/mcp';
@@ -59,6 +64,7 @@ export const previewRouter = createRouter()
 	.merge(tabInfoPreviewHandler)
 	.merge(statsPreviewHandler)
 	.merge(consolePreviewHandler)
+	.merge(browsingDataPreviewHandler)
 	.merge(cleanupPreviewHandler)
 	.merge(streamPreviewHandler)
 	.merge(nativeUIPreviewHandler)
@@ -73,6 +79,11 @@ export const previewRouter = createRouter()
 		url: t.String(),
 		title: t.String(),
 		isActive: t.Boolean(),
+		/**
+		 * The launch this tab came from, when a client started it. Absent for
+		 * tabs the backend opened on its own (an agent, a popup).
+		 */
+		launchId: t.Optional(t.String()),
 		timestamp: t.Number()
 	}))
 	.emit('preview:browser-tab-closed', t.Object({
@@ -85,6 +96,16 @@ export const previewRouter = createRouter()
 		projectId: t.String(),
 		previousTabId: t.String(),
 		newTabId: t.String(),
+		timestamp: t.Number()
+	}))
+	.emit('preview:browser-tab-lifecycle', t.Object({
+		projectId: t.String(),
+		tabId: t.String(),
+		/**
+		 * Whether the page is frozen. A sleeping tab runs no script at all —
+		 * the strip says so rather than showing it as a page still working.
+		 */
+		sleeping: t.Boolean(),
 		timestamp: t.Number()
 	}))
 	.emit('preview:browser-tab-navigated', t.Object({

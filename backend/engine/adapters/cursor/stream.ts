@@ -30,11 +30,13 @@ import { debug } from '$shared/utils/logger';
 import { engineQueries } from '$backend/database/queries/engine-queries';
 import { syncSkills } from '$backend/skills';
 import { syncEngineArtifacts, buildArtifactsPromptContext } from '$backend/engine/artifact-sync';
+import { resolveProjectBridge, type ProjectBridge } from '$backend/artifacts/project';
 import { artifactFilter } from '$backend/profiles';
+import { resolvePermissionsFromDb, excludedBuiltinTools } from '$backend/permissions';
 import { getCursorMcpConfig } from '../../../mcp';
 import { subagentQueries } from '$backend/database/queries';
 import { readSubagentMd } from '$backend/subagents/store';
-import { buildJsonPrompt, extractJson } from '../../structured-helpers';
+import { buildJsonPrompt, extractJson, emptyGenerationError } from '../../structured-helpers';
 import { EngineRuns } from '../run-registry';
 import { getActiveCursorAccount, resolveCursorApiKey } from './credential';
 import { getCursorStore } from './environment';
@@ -137,17 +139,24 @@ export class CursorEngine implements AIEngine {
 		return fetchCursorModels();
 	}
 
-	/** Build the `agents` config from Clopen's enabled subagents (Cursor-native). */
-	private async buildAgents(): Promise<Record<string, AgentDefinition> | undefined> {
-		const subagents = subagentQueries.getEnabled();
-		if (subagents.length === 0) return undefined;
+	/**
+	 * Build the `agents` config from Clopen's enabled subagents plus the
+	 * repository's own (Cursor-native). Clopen runs Cursor with its project
+	 * setting source off, so repo subagents only arrive this way; an installed
+	 * subagent wins a slug clash.
+	 */
+	private async buildAgents(project: ProjectBridge): Promise<Record<string, AgentDefinition> | undefined> {
 		const agents: Record<string, AgentDefinition> = {};
-		for (const s of subagents) {
+		for (const s of subagentQueries.getEnabled()) {
 			const md = (await readSubagentMd(s.slug)) ?? '';
 			const prompt = stripFrontmatter(md) || `You are the ${s.name} subagent. ${s.description}`;
 			agents[s.slug] = { description: s.description || s.name, prompt, model: 'inherit' };
 		}
-		return agents;
+		for (const s of project.subagents) {
+			if (agents[s.slug]) continue;
+			agents[s.slug] = { description: s.description || s.name, prompt: s.prompt, model: 'inherit' };
+		}
+		return Object.keys(agents).length > 0 ? agents : undefined;
 	}
 
 	async *streamQuery(options: EngineQueryOptions): AsyncGenerator<EngineOutput, void, unknown> {
@@ -176,6 +185,23 @@ export class CursorEngine implements AIEngine {
 		const mcpProfileFilter = artifactFilter(profileId, 'mcp') ?? undefined;
 		await syncSkills('cursor', profileId);
 		await syncEngineArtifacts('cursor', profileId);
+		// Cursor's own repo scan is gated on `settingSources`, which Clopen leaves
+		// off — so every project artifact reaches it through Clopen.
+		const projectBridge = await resolveProjectBridge('cursor', resolvedProjectPath, options.mcpContext?.projectId);
+
+		// ── Permissions → disallowedTools ──
+		// Cursor exposes no per-call permission hook, but `AgentOptions` takes a
+		// `disallowedTools` list that is applied before the toolset is offered to
+		// the model — strictly stronger than a hook, since a blocked tool is never
+		// even visible. Names must come from the SDK's own vocabulary (see
+		// ENGINE_BUILTIN_TOOLS.cursor); an unknown one throws at Agent.create.
+		// Not persisted on the agent, so it is passed to BOTH create and resume.
+		const permissions = resolvePermissionsFromDb('cursor', options.mcpContext?.projectId, profileId);
+		const disallowedTools = excludedBuiltinTools(permissions, 'cursor');
+		if (disallowedTools.length > 0) {
+			debug.log('engine', `Cursor permissions: withholding ${disallowedTools.length} tool(s) — ${disallowedTools.join(', ')}`);
+		}
+		const toolPolicy = disallowedTools.length > 0 ? { disallowedTools } : {};
 
 		// ── Output queue merging the pull stream with the ask tool's push emissions ──
 		const queue = new EventQueue<EngineOutput>();
@@ -193,7 +219,7 @@ export class CursorEngine implements AIEngine {
 		});
 		const customTools: Record<string, SDKCustomTool> = { AskUserQuestion: askTool };
 		const mcpServers = getCursorMcpConfig(mcpProfileFilter, options.mcpContext);
-		const agents = await this.buildAgents();
+		const agents = await this.buildAgents(projectBridge);
 
 		const { Agent } = await loadEngineSdk<typeof import('@cursor/sdk')>('cursor', '@cursor/sdk');
 		const store = await getCursorStore(projectPath);
@@ -224,6 +250,7 @@ export class CursorEngine implements AIEngine {
 					apiKey,
 					model: { id: modelId },
 					local: localOptions,
+					...toolPolicy,
 					...(Object.keys(mcpServers).length ? { mcpServers } : {}),
 					...(agents ? { agents } : {}),
 				})
@@ -231,6 +258,7 @@ export class CursorEngine implements AIEngine {
 					apiKey,
 					model: { id: modelId },
 					local: localOptions,
+					...toolPolicy,
 					...(Object.keys(mcpServers).length ? { mcpServers } : {}),
 					...(agents ? { agents } : {}),
 				});
@@ -246,8 +274,13 @@ export class CursorEngine implements AIEngine {
 		converterHolder.current = converter;
 
 		// Build the user turn (text + image attachments).
+		//
+		// The artifact context rides the user message because `@cursor/sdk` has no
+		// system-prompt option — `AgentOptions` exposes model/tools/mcpServers/agents
+		// and nothing else. It is rebuilt per turn on purpose: the active Profile can
+		// change mid-session, and a stale advertisement is worse than a repeated one.
 		const promptText = prompt.content.filter(b => b.type === 'text').map(b => (b.type === 'text' ? b.text : '')).join('\n');
-		const artifacts = buildArtifactsPromptContext(profileId);
+		const artifacts = buildArtifactsPromptContext('cursor', profileId, projectBridge);
 		const text = artifacts ? `${artifacts}\n\n${promptText}` : promptText;
 		const images: SDKImage[] = [];
 		for (const b of prompt.content) {
@@ -394,7 +427,7 @@ export class CursorEngine implements AIEngine {
 		try {
 			const run = await agent.send(buildJsonPrompt(prompt, schema));
 			const result = await run.wait();
-			if (!result.result?.trim()) throw new Error('Cursor returned no structured output');
+			if (!result.result?.trim()) throw emptyGenerationError('Cursor');
 			return extractJson<T>(result.result);
 		} finally {
 			try { agent.close(); } catch { /* ignore */ }

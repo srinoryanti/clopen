@@ -19,15 +19,16 @@
 	import ArtifactsSettings from './model/ArtifactsSettings.svelte';
 	import AIEnginesSettings from './engines/AIEnginesSettings.svelte';
 	import StackSettings from './stack/StackSettings.svelte';
-	import McpSettings from './mcp/McpSettings.svelte';
+	import IntegrationsSettings from './integrations/IntegrationsSettings.svelte';
 	import SkillsSettings from './skills/SkillsSettings.svelte';
-	import CommandsSettings from './commands/CommandsSettings.svelte';
 	import SubagentsSettings from './subagents/SubagentsSettings.svelte';
 	import InstructionsSettings from './instructions/InstructionsSettings.svelte';
 	import PermissionsSettings from './permissions/PermissionsSettings.svelte';
+	import FileSharesSettings from './files/FileSharesSettings.svelte';
 	import MemorySettings from './memory/MemorySettings.svelte';
 	import MemoryModelSettings from './model/MemoryModelSettings.svelte';
 	import ProfilesSettings from './profiles/ProfilesSettings.svelte';
+	import GitIdentitiesSettings from './git/GitIdentitiesSettings.svelte';
 	import AppearanceSettings from './appearance/AppearanceSettings.svelte';
 	import AccountSettings from './account/AccountSettings.svelte';
 	import NotificationSettings from './notifications/NotificationSettings.svelte';
@@ -35,8 +36,16 @@
 	import InviteManagement from './admin/InviteManagement.svelte';
 	import SecuritySettings from './security/SecuritySettings.svelte';
 	import SystemSettings from './system/SystemSettings.svelte';
-	import AboutDeviceSettings from './system/AboutDeviceSettings.svelte';
+	import AboutDeviceSettings, {
+		prefetchDeviceInfo,
+		prefetchProjectsOverview
+	} from './system/AboutDeviceSettings.svelte';
 	import TunnelSettings from './tunnel/TunnelSettings.svelte';
+	import ScopedSection from './project/ScopedSection.svelte';
+	import ProjectItemsPanel from './project/ProjectItemsPanel.svelte';
+	import ProjectInstructionsPanel from './project/ProjectInstructionsPanel.svelte';
+	import ProjectMcpPanel from './project/ProjectMcpPanel.svelte';
+	import ProjectPermissionsPanel from './project/ProjectPermissionsPanel.svelte';
 
 	// Responsive state
 	let isMobileMenuOpen = $state(false);
@@ -110,6 +119,18 @@
 	$effect(() => {
 		if (settingsModalState.isOpen && !isMobile) {
 			setTimeout(() => searchInputRef?.focus(), 60);
+		}
+	});
+
+	// Prefetch Device data the moment the modal opens (admin only) so the slow
+	// system:device-info probes and the projects:overview snapshot already run
+	// in background while the user browses other tabs. Clicking Device then
+	// shows cached data instantly instead of a long skeleton like other tabs
+	// that render from local stores.
+	$effect(() => {
+		if (settingsModalState.isOpen && isAdmin) {
+			prefetchDeviceInfo();
+			prefetchProjectsOverview();
 		}
 	});
 
@@ -278,6 +299,10 @@
 						<div in:fly={{ x: 20, duration: 200 }}>
 							<GitSettings />
 						</div>
+					{:else if activeSection === 'git-identities'}
+						<div in:fly={{ x: 20, duration: 200 }}>
+							<GitIdentitiesSettings />
+						</div>
 					{:else if activeSection === 'artifacts'}
 						<div in:fly={{ x: 20, duration: 200 }}>
 							<ArtifactsSettings />
@@ -306,29 +331,59 @@
 						<div in:fly={{ x: 20, duration: 200 }}>
 							<StackSettings />
 						</div>
-					{:else if activeSection === 'mcp' && isAdmin}
+					{:else if activeSection === 'integrations' && isAdmin}
 						<div in:fly={{ x: 20, duration: 200 }}>
-							<McpSettings />
+							<ScopedSection
+								title="Integrations"
+								description="Connected services and MCP servers."
+							>
+								{#snippet global()}<IntegrationsSettings showHeader={false} />{/snippet}
+								{#snippet project(projectId)}<ProjectMcpPanel {projectId} />{/snippet}
+							</ScopedSection>
 						</div>
 					{:else if activeSection === 'skills' && isAdmin}
 						<div in:fly={{ x: 20, duration: 200 }}>
-							<SkillsSettings />
-						</div>
-					{:else if activeSection === 'commands' && isAdmin}
-						<div in:fly={{ x: 20, duration: 200 }}>
-							<CommandsSettings />
+							<ScopedSection
+								title="Skills"
+								description="Reusable instructions and /commands."
+							>
+								{#snippet global()}<SkillsSettings showHeader={false} />{/snippet}
+								{#snippet project(projectId)}<ProjectItemsPanel {projectId} kind="skill" />{/snippet}
+							</ScopedSection>
 						</div>
 					{:else if activeSection === 'subagents' && isAdmin}
 						<div in:fly={{ x: 20, duration: 200 }}>
-							<SubagentsSettings />
+							<ScopedSection
+								title="Subagents"
+								description="Specialized agents to delegate tasks to."
+							>
+								{#snippet global()}<SubagentsSettings showHeader={false} />{/snippet}
+								{#snippet project(projectId)}<ProjectItemsPanel {projectId} kind="subagent" />{/snippet}
+							</ScopedSection>
 						</div>
 					{:else if activeSection === 'instructions' && isAdmin}
 						<div in:fly={{ x: 20, duration: 200 }}>
-							<InstructionsSettings />
+							<ScopedSection
+								title="Instructions"
+								description="Standing instructions for every engine."
+							>
+								{#snippet global()}<InstructionsSettings showHeader={false} />{/snippet}
+								{#snippet project(projectId)}<ProjectInstructionsPanel {projectId} />{/snippet}
+							</ScopedSection>
 						</div>
 					{:else if activeSection === 'permissions' && isAdmin}
 						<div in:fly={{ x: 20, duration: 200 }}>
-							<PermissionsSettings />
+							<ScopedSection
+								title="Permissions"
+								description="Allow or deny tools per engine."
+							>
+								{#snippet global()}<PermissionsSettings showHeader={false} />{/snippet}
+								{#snippet project(projectId)}<ProjectPermissionsPanel {projectId} />{/snippet}
+							</ScopedSection>
+						</div>
+					{:else if activeSection === 'file-shares'}
+						<div in:fly={{ x: 20, duration: 200 }}>
+							<FileSharesSettings />
 						</div>
 					{:else if activeSection === 'memory' && isAdmin}
 						<div in:fly={{ x: 20, duration: 200 }}>

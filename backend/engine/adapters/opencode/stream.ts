@@ -42,15 +42,17 @@ import {
 	mapToolName,
 	TOOL_NAME_MAP,
 } from './message-converter';
-import { ensureClient, acquireServer, releaseServer, getClient, getServerUrl, type ServerInstance } from './server';
+import { ensureClient, acquireServer, releaseServer, getDefaultServer, type ServerInstance } from './server';
 import { syncSkills } from '$backend/skills';
 import { syncEngineArtifacts, buildArtifactsPromptContext } from '$backend/engine/artifact-sync';
+import { resolveProjectBridge } from '$backend/artifacts/project';
+import { resolveOsPath } from '$backend/utils/paths';
 import { artifactFilter } from '$backend/profiles';
 import { buildOpenCodeInlineAgents } from '$backend/subagents';
 import { getOpenCodeProfileDisabledToolIds } from '$backend/mcp';
 import { resolvePermissionsFromDb, matchesAny, type ResolvedPermissions } from '$backend/permissions';
 import { formatSessionError, handleStreamError } from './error-handler';
-import { buildJsonPrompt, extractJson } from '../../structured-helpers';
+import { buildJsonPrompt, extractJson, emptyGenerationError } from '../../structured-helpers';
 import { EngineRuns } from '../run-registry';
 import { debug } from '$shared/utils/logger';
 
@@ -221,14 +223,30 @@ export class OpenCodeEngine implements AIEngine {
 		// server, different Profiles get isolated servers, concurrently.
 		const mcpProfileFilter = artifactFilter(profileId, 'mcp') ?? undefined;
 		const subagentFilter = artifactFilter(profileId, 'subagent') ?? undefined;
-		const inlineAgents = await buildOpenCodeInlineAgents(profileId);
+		// Repository artifacts Open Code doesn't read natively (it reads
+		// `.opencode/*`, `.agents/skills`, `.claude/skills` and AGENTS.md itself).
+		// Project subagents join the inline agents (an installed one wins a slug
+		// clash); the approved `.agents/mcp.json` joins MCP via `projectId`.
+		const projectBridge = await resolveProjectBridge('opencode', resolveOsPath(projectPath), options.mcpContext?.projectId);
+		const inlineAgents = {
+			...Object.fromEntries(projectBridge.subagents.map(sub => [sub.slug, {
+				description: sub.description || sub.name,
+				mode: 'subagent' as const,
+				prompt: sub.prompt,
+				...(sub.model ? { model: sub.model } : {})
+			}])),
+			...(await buildOpenCodeInlineAgents(profileId))
+		};
 		// The pool derives the key from the config it is about to spawn with, so a
 		// changed connector set, provider, credential or subagent prompt routes this
 		// stream to a server built from it — while any server still serving another
 		// stream keeps running until that stream is done. Holding the server by
 		// stream id is what makes that safe: a held server is never reaped.
 		const holderId = options.mcpContext?.streamId;
-		const server = await acquireServer({ mcpProfileFilter, subagentFilter, inlineAgents }, holderId);
+		const server = await acquireServer(
+			{ mcpProfileFilter, subagentFilter, inlineAgents, gitIdentityEnv: options.gitIdentityEnv, projectId: options.mcpContext?.projectId ?? null },
+			holderId
+		);
 		run.server = server;
 		run.holder = holderId ? { key: server.key, holderId } : null;
 		const client = server.client;
@@ -250,7 +268,7 @@ export class OpenCodeEngine implements AIEngine {
 			// so advertise the profile-scoped set PER-SESSION by prepending it as a
 			// leading context part each turn (authoritative for synthetic skills;
 			// advisory on top of the native command/agent dirs).
-			const artifactsContext = buildArtifactsPromptContext(profileId);
+			const artifactsContext = buildArtifactsPromptContext('opencode', profileId, projectBridge);
 			if (artifactsContext) {
 				promptParts.unshift({ type: 'text', text: artifactsContext });
 			}
@@ -887,7 +905,7 @@ export class OpenCodeEngine implements AIEngine {
 		//    The pool hold is still held here on purpose — handing the server back
 		//    first could let it be reaped out from under this very call.
 		for (const run of targets) {
-			const client = run.server?.client ?? getClient();
+			const client = run.server?.client ?? getDefaultServer()?.client;
 			const { sessionId, projectPath } = run;
 			if (!client || !sessionId) continue;
 			try {
@@ -948,8 +966,8 @@ export class OpenCodeEngine implements AIEngine {
 	 * POST /question/{requestID}/reply to send user answers back to the OpenCode server.
 	 */
 	private replyToQuestion(run: OpenCodeRun | null, requestId: string, orderedAnswers: string[][]): void {
-		const serverUrl = run?.server?.url ?? getServerUrl();
-		if (!serverUrl) {
+		const server = run?.server ?? getDefaultServer();
+		if (!server) {
 			debug.warn('engine', 'replyToQuestion: Server URL not available');
 			return;
 		}
@@ -959,12 +977,12 @@ export class OpenCodeEngine implements AIEngine {
 		// a shared "current server" would post this reply into the wrong one and
 		// leave the asking session waiting forever.
 		const dirParam = run?.projectPath ? `?directory=${encodeURIComponent(run.projectPath)}` : '';
-		const url = `${serverUrl}/question/${requestId}/reply${dirParam}`;
+		const url = `${server.url}/question/${requestId}/reply${dirParam}`;
 		debug.log('engine', `Replying to question ${requestId}:`, orderedAnswers);
 
 		fetch(url, {
 			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
+			headers: { 'Content-Type': 'application/json', ...server.authHeaders },
 			body: JSON.stringify({ answers: orderedAnswers }),
 		}).then(async res => {
 			if (res.ok) {
@@ -986,15 +1004,15 @@ export class OpenCodeEngine implements AIEngine {
 		// still-running one when there is exactly one, else the shared client.
 		const running = this.runs.all();
 		const run = running.length === 1 ? running[0] : null;
-		const serverUrl = run?.server?.url ?? getServerUrl();
-		if (!serverUrl) {
+		const server = run?.server ?? getDefaultServer();
+		if (!server) {
 			debug.warn('engine', 'fetchAndReplyToQuestion: Server URL not available');
 			return;
 		}
 
 		try {
 			const dirParam = run?.projectPath ? `?directory=${encodeURIComponent(run.projectPath)}` : '';
-			const res = await fetch(`${serverUrl}/question${dirParam}`);
+			const res = await fetch(`${server.url}/question${dirParam}`, { headers: server.authHeaders });
 			if (!res.ok) {
 				debug.error('engine', `Failed to list pending questions: ${res.status}`);
 				return;
@@ -1029,14 +1047,14 @@ export class OpenCodeEngine implements AIEngine {
 	 * the v2 permission.reply method.
 	 */
 	private replyPermission(run: OpenCodeRun, permissionId: string, sessionId: string, response: 'once' | 'reject'): void {
-		const serverUrl = run.server?.url ?? getServerUrl();
-		if (!serverUrl) return;
+		const server = run.server ?? getDefaultServer();
+		if (!server) return;
 		const verb = response === 'reject' ? 'rejected' : 'approved';
 
 		// Try v2 endpoint first (/permission/{requestID}/reply), fall back to v1
-		fetch(`${serverUrl}/permission/${permissionId}/reply`, {
+		fetch(`${server.url}/permission/${permissionId}/reply`, {
 			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
+			headers: { 'Content-Type': 'application/json', ...server.authHeaders },
 			body: JSON.stringify({ reply: response }),
 		}).then(res => {
 			if (res.ok) {
@@ -1044,7 +1062,7 @@ export class OpenCodeEngine implements AIEngine {
 				return;
 			}
 			// v2 endpoint not available — try v1
-			const client = run.server?.client ?? getClient();
+			const client = run.server?.client ?? getDefaultServer()?.client;
 			if (client) {
 				client.postSessionIdPermissionsPermissionId({
 					path: { id: sessionId, permissionID: permissionId },
@@ -1147,7 +1165,7 @@ export class OpenCodeEngine implements AIEngine {
 
 		const data = response.data;
 		if (!data) {
-			throw new Error('OpenCode returned empty response');
+			throw emptyGenerationError('OpenCode', 'no response body');
 		}
 
 		const parts = data.parts || [];
@@ -1166,9 +1184,7 @@ export class OpenCodeEngine implements AIEngine {
 		const source = textContent || collectText('reasoning');
 
 		if (!source) {
-			throw new Error(
-				`OpenCode returned no parseable content (received parts: ${parts.map((p: any) => p.type).join(', ') || 'none'})`
-			);
+			throw emptyGenerationError('OpenCode', `received parts: ${parts.map((p: any) => p.type).join(', ') || 'none'}`);
 		}
 
 		debug.log('engine', `[OC structured] Raw text: ${source.slice(0, 200)}`);

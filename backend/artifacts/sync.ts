@@ -10,23 +10,10 @@
  */
 
 import { join } from 'path';
-import { mkdir, readdir, rm, writeFile, cp, stat } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rm, writeFile, cp, stat } from 'node:fs/promises';
 import { resolveArtifact } from './matrix';
-import { markersFor, writeManagedBlock } from './markers';
+import { markersForType, writeManagedBlock } from './markers';
 import type { ArtifactContext, ArtifactType, ManagedArtifact } from './types';
-
-/**
- * Managed-block marker id per artifact type (uppercased feature name). `'mcp'`
- * and `'permission'` are excluded: neither routes through this generic
- * file-materializer (MCP is a config-object path; permissions have their own
- * runtime-hook enforcement + `backend/permissions/materialize.ts`).
- */
-const MARKER_ID: Record<Exclude<ArtifactType, 'mcp' | 'permission'>, string> = {
-	skill: 'SKILLS',
-	command: 'COMMANDS',
-	subagent: 'SUBAGENTS',
-	instruction: 'INSTRUCTIONS'
-};
 
 async function pathExists(path: string): Promise<boolean> {
 	try {
@@ -37,10 +24,63 @@ async function pathExists(path: string): Promise<boolean> {
 	}
 }
 
-/** Mirror one canonical folder into a destination dir under `<slug>/` (replacing any stale copy). */
-async function mirrorFolder(sourceDir: string, destDir: string, slug: string): Promise<void> {
+/**
+ * Write only when the bytes differ.
+ *
+ * This runs at every stream start, and a no-op rewrite still moves mtime. The
+ * Open Code pool fingerprints these files to decide whether its baked config
+ * changed, so an unconditional write made every single turn spawn a fresh
+ * `opencode serve` process for a config that was byte-identical.
+ */
+async function writeFileIfChanged(filePath: string, content: string): Promise<void> {
+	try {
+		if ((await readFile(filePath, 'utf8')) === content) return;
+	} catch { /* missing or unreadable — fall through and write */ }
+	await writeFile(filePath, content, 'utf8');
+}
+
+/** Every file under `dir`, keyed by path relative to it. Missing dir → empty map. */
+async function fileStats(dir: string): Promise<Map<string, { size: number; mtimeMs: number }>> {
+	const out = new Map<string, { size: number; mtimeMs: number }>();
+	const walk = async (current: string, prefix: string): Promise<void> => {
+		let entries;
+		try {
+			entries = await readdir(current, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const entry of entries) {
+			const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+			if (entry.isDirectory()) {
+				await walk(join(current, entry.name), relative);
+				continue;
+			}
+			try {
+				const info = await stat(join(current, entry.name));
+				out.set(relative, { size: info.size, mtimeMs: info.mtimeMs });
+			} catch { /* raced away */ }
+		}
+	};
+	await walk(dir, '');
+	return out;
+}
+
+/** True when `destDir` already holds a current copy — same files, same sizes, none of them older than the source. */
+async function folderInSync(sourceDir: string, destDir: string): Promise<boolean> {
+	const [source, dest] = await Promise.all([fileStats(sourceDir), fileStats(destDir)]);
+	if (source.size === 0 || source.size !== dest.size) return false;
+	for (const [relative, sourceInfo] of source) {
+		const destInfo = dest.get(relative);
+		if (!destInfo || destInfo.size !== sourceInfo.size || destInfo.mtimeMs < sourceInfo.mtimeMs) return false;
+	}
+	return true;
+}
+
+/** Mirror one canonical folder into a destination dir under `<slug>/`, skipping the copy when it is already current. */
+export async function mirrorFolder(sourceDir: string, destDir: string, slug: string): Promise<void> {
 	if (!(await pathExists(sourceDir))) return;
 	const dest = join(destDir, slug);
+	if (await folderInSync(sourceDir, dest)) return;
 	await rm(dest, { recursive: true, force: true });
 	await mkdir(destDir, { recursive: true });
 	await cp(sourceDir, dest, { recursive: true });
@@ -69,7 +109,10 @@ export interface MaterializeInput {
  * start: native dirs are reconciled and synthetic blocks are rewritten in place.
  */
 export async function materializeArtifacts(
-	type: Exclude<ArtifactType, 'mcp' | 'instruction'>,
+	// `permission` is excluded alongside `mcp`/`instruction`: it has no managed
+	// block id because its enforcement is a runtime hook, and its optional on-disk
+	// file is written by `backend/permissions/materialize.ts`, not here.
+	type: Exclude<ArtifactType, 'mcp' | 'instruction' | 'permission'>,
 	ctx: ArtifactContext,
 	input: MaterializeInput
 ): Promise<void> {
@@ -104,7 +147,7 @@ export async function materializeArtifacts(
 			if (resolution.format === 'folder-md') {
 				if (item.sourceDir) await mirrorFolder(item.sourceDir, target, item.slug);
 			} else if (item.document != null) {
-				await writeFile(join(target, `${item.slug}.md`), item.document, 'utf8');
+				await writeFileIfChanged(join(target, `${item.slug}.md`), item.document);
 			}
 		}
 
@@ -117,14 +160,12 @@ export async function materializeArtifacts(
 		// writeManagedBlock is a no-op when no such block exists.
 		const staleMemoryFile = resolveArtifact('instruction', ctx).locateEffective(ctx);
 		if (staleMemoryFile) {
-			await writeManagedBlock(staleMemoryFile, '', markersFor(MARKER_ID[type as keyof typeof MARKER_ID]));
+			await writeManagedBlock(staleMemoryFile, '', markersForType(type));
 		}
 		return;
 	}
 
-	// preamble-region → managed block inside the engine memory file. `type` is
-	// always one of the file-materialized kinds here (mcp/permission never route
-	// through this writer), so the MARKER_ID lookup is total in practice.
+	// preamble-region → managed block inside the engine memory file.
 	const build = input.buildPreamble ?? ((items) => defaultPreamble(type, items));
-	await writeManagedBlock(target, build(input.enabled), markersFor(MARKER_ID[type as keyof typeof MARKER_ID]));
+	await writeManagedBlock(target, build(input.enabled), markersForType(type));
 }

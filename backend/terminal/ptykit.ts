@@ -7,13 +7,15 @@
  * There is no second WebSocket — the server is driven over Clopen's existing
  * app-wide socket via `handleFrame` (see `backend/ws/terminal/tunnel.ts`).
  *
- * - `namespace` = Clopen `projectId` (collaborative room + anti-hijack scope).
+ * - `namespace` = workspace scope key (project, or one of its worktrees).
  * - `authorize` bridges to Clopen's project-access check.
  */
 
 import { PtyKitManager } from '@myrialabs/ptykit/core';
 import { createPtyKitServer } from '@myrialabs/ptykit/server';
 import { projectQueries } from '$backend/database/queries';
+import { isScopeOfProject, makeScopeKey, scopeProjectId } from '$shared/utils/workspace-scope';
+import { writeScopeConfig } from '$backend/git/identity';
 
 /** Terminal-friendly env, matching the previous `createCleanPtyEnv` overrides. */
 const TERMINAL_ENV = {
@@ -46,19 +48,70 @@ export const ptyKitServer = createPtyKitServer(ptyKitManager, {
 	authorize: (ctx) => {
 		const userId = ctx.conn.data.userId;
 		if (typeof userId !== 'string' || !userId) return false;
-		return projectQueries.userHasProject(userId, ctx.namespace);
+		// The namespace separates worktrees; access is still the project's call.
+		const allowed = projectQueries.userHasProject(userId, scopeProjectId(ctx.namespace));
+		if (allowed) knownNamespaces.add(ctx.namespace);
+		return allowed;
+	},
+	/**
+	 * The shell inherits the git identity of whoever opened it, for the project
+	 * it belongs to. Without this a `git commit` typed into the terminal would
+	 * use the machine's identity while the same commit from the Git panel used
+	 * the chosen one — the same repository, two different authors.
+	 *
+	 * Pointed at a FILE rather than given the `GIT_CONFIG_*` block the other
+	 * surfaces use. A shell lives for hours and its environment is fixed at
+	 * spawn, so an inlined identity goes stale the moment the user switches
+	 * accounts — silently, since the tab keeps working. Git re-reads a config
+	 * file on every invocation, so the switch reaches tabs that are already open.
+	 * See `backend/git/identity/scope-config.ts`.
+	 *
+	 * `GIT_CONFIG_GLOBAL` is only set when the file was actually written: it
+	 * REPLACES `~/.gitconfig`, so aiming it at a missing path would take the
+	 * user's own global config away from every git command in the terminal.
+	 */
+	env: async (ctx): Promise<Record<string, string>> => {
+		const userId = ctx.conn.data.userId;
+		if (typeof userId !== 'string' || !userId) return {};
+		const path = await writeScopeConfig(userId, scopeProjectId(ctx.namespace));
+		return path ? { GIT_CONFIG_GLOBAL: path } : {};
 	}
 });
 
 /**
- * Kill every PTY session belonging to a project (namespace). Used on project
- * delete/remove to reap orphaned shells. Returns the number killed.
+ * Namespaces this process has served. PtyKit lists sessions per namespace only,
+ * so reaping a whole project needs the set of its workspace scopes.
  */
-export function cleanupProjectSessions(projectId: string): number {
+const knownNamespaces = new Set<string>();
+
+/** Kill every session in one namespace. */
+function killNamespace(namespace: string): number {
 	let killed = 0;
-	for (const session of ptyKitManager.list(projectId)) {
+	for (const session of ptyKitManager.list(namespace)) {
 		ptyKitManager.killSession(session.sessionId, 'SIGKILL');
 		killed++;
 	}
+	return killed;
+}
+
+/**
+ * Kill every PTY session belonging to a project, across the main tree and all
+ * of its worktrees. Used on project delete/remove to reap orphaned shells.
+ */
+export function cleanupProjectSessions(projectId: string): number {
+	let killed = 0;
+	for (const namespace of knownNamespaces) {
+		if (!isScopeOfProject(namespace, projectId)) continue;
+		killed += killNamespace(namespace);
+		knownNamespaces.delete(namespace);
+	}
+	return killed;
+}
+
+/** Kill every PTY session inside one worktree — used when it is deleted. */
+export function cleanupWorktreeSessions(projectId: string, worktreeId: string): number {
+	const namespace = makeScopeKey(projectId, worktreeId);
+	const killed = killNamespace(namespace);
+	knownNamespaces.delete(namespace);
 	return killed;
 }

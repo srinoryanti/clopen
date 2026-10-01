@@ -8,11 +8,15 @@ import { BrowserVideoCapture } from './browser-video-capture.js';
 import { BrowserDialogHandler } from './browser-dialog-handler.js';
 import { BrowserNativeUIHandler } from './browser-native-ui-handler.js';
 import { BrowserHostBridge, type HostResponse } from './browser-host-bridge.js';
+import { BrowserTabLifecycle } from './browser-tab-lifecycle.js';
 import { browserMcpControl } from './browser-mcp-control.js';
+import { browserPool } from './browser-pool.js';
 import { ws } from '$backend/utils/ws';
 import { getViewportDimensions } from '$shared/constants/preview.js';
 import { debug } from '$shared/utils/logger';
+import { scopeProjectId } from '$shared/utils/workspace-scope';
 import type {
+	BrowserSiteData,
 	BrowserTab,
 	BrowserTabInfo,
 	BrowserConsoleMessage,
@@ -38,7 +42,7 @@ import type {
  *
  * Architecture:
  * - Tabs are the primary unit (no separate session concept)
- * - Each tab = isolated browser context + page
+ * - Each tab = a page in its workspace's shared browser context
  * - Event-driven communication with frontend
  * - Manages all browser operations: streaming, interaction, console, etc.
  * - **PROJECT ISOLATION**: Each instance is isolated per project
@@ -52,12 +56,22 @@ export class BrowserPreviewService extends EventEmitter {
 	private dialogHandler: BrowserDialogHandler;
 	private nativeUIHandler: BrowserNativeUIHandler;
 	private hostBridge: BrowserHostBridge;
+	private lifecycle: BrowserTabLifecycle;
 
 	// Store context menu info for later action execution
 	private contextMenus = new Map<string, BrowserContextMenuInfo>();
 
 	/** Tabs whose page is showing something full screen — see applyFullscreenState. */
 	private fullscreenTabs = new Set<string>();
+
+	/**
+	 * Page rebuilds in flight, per tab.
+	 *
+	 * A dead page is noticed by whatever touches the tab first — the stream's
+	 * frame guard, the tab list, an MCP action — and often by several of them
+	 * at once, so the first one to ask owns the rebuild and the rest wait on it.
+	 */
+	private tabRecoveries = new Map<string, Promise<boolean>>();
 
 	// Project ID for isolation (REQUIRED)
 	private projectId: string;
@@ -73,7 +87,14 @@ export class BrowserPreviewService extends EventEmitter {
 
 		// Initialize managers with projectId for isolation
 		this.tabManager = new BrowserTabManager(projectId);
-		this.consoleManager = new BrowserConsoleManager();
+		// Built before the console manager, which asks it who is watching.
+		this.lifecycle = new BrowserTabLifecycle({
+			getPage: (tabId) => this.tabManager.peekTab(tabId)?.page ?? null,
+			isPinned: (tabId) => this.isTabPinnedAwake(tabId)
+		});
+		this.consoleManager = new BrowserConsoleManager({
+			isWatched: (tabId) => this.lifecycle.hasViewers(tabId)
+		});
 		this.interactionHandler = new BrowserInteractionHandler();
 		this.navigationTracker = new BrowserNavigationTracker();
 		this.videoCapture = new BrowserVideoCapture();
@@ -85,7 +106,48 @@ export class BrowserPreviewService extends EventEmitter {
 		this.setupEventForwarding();
 	}
 
+	/**
+	 * Tabs that must keep running even though nobody is watching them.
+	 *
+	 * An agent's tab, because the run continues whether or not a panel is open
+	 * on it; and a tab still loading or being rebuilt, because freezing one
+	 * mid-navigation would strand it half rendered with no event left to wake
+	 * it.
+	 */
+	private isTabPinnedAwake(tabId: string): boolean {
+		if (browserMcpControl.isTabControlled(tabId, this.projectId)) return true;
+
+		const tab = this.tabManager.peekTab(tabId);
+		if (!tab) return false;
+
+		return !!tab.isLoading || !!tab.isRecovering;
+	}
+
+	/** Wake a tab and wait for it — required before anything runs script in it. */
+	async ensureTabAwake(tabId: string): Promise<void> {
+		await this.lifecycle.ensureAwake(tabId);
+	}
+
+	/** Push back a tab's freeze without waiting for it to wake. */
+	noteTabActivity(tabId: string): void {
+		this.lifecycle.touch(tabId);
+	}
+
+	isTabSleeping(tabId: string): boolean {
+		return this.lifecycle.isFrozen(tabId);
+	}
+
 	private setupEventForwarding() {
+		// A page put to sleep (or woken) is visible in the tab strip, so the
+		// viewer is told the same way it is told about a lock.
+		this.lifecycle.on('state', ({ tabId, state }: { tabId: string; state: string }) => {
+			this.emit('preview:browser-tab-lifecycle', {
+				tabId,
+				sleeping: state === 'frozen',
+				timestamp: Date.now()
+			});
+		});
+
 		// Forward console events
 		this.consoleManager.on('console-message', (data) => {
 			this.emit('preview:browser-console-message', data);
@@ -178,6 +240,12 @@ export class BrowserPreviewService extends EventEmitter {
 		});
 		this.tabManager.on('preview:browser-tab-switched', (data) => {
 			this.emit('preview:browser-tab-switched', data);
+		});
+
+		// A tab whose page died. The tab manager can replace the page but not
+		// the per-page state layered on top of it, so the rebuild is owned here.
+		this.tabManager.on('preview:browser-tab-unhealthy', (data: { tabId: string; reason: string }) => {
+			if (data?.tabId) void this.recoverTab(data.tabId, data.reason);
 		});
 		this.tabManager.on('preview:browser-tab-navigated', (data) => {
 			this.emit('preview:browser-tab-navigated', data);
@@ -279,7 +347,12 @@ export class BrowserPreviewService extends EventEmitter {
 	 * - Desktop/laptop: landscape
 	 * - Tablet/mobile: portrait
 	 */
-	async createTab(url?: string, deviceSize: DeviceSize = 'laptop', rotation?: Rotation): Promise<BrowserTab> {
+	async createTab(
+		url?: string,
+		deviceSize: DeviceSize = 'laptop',
+		rotation?: Rotation,
+		launchId?: string
+	): Promise<BrowserTab> {
 		// Use device-appropriate default rotation if not specified
 		const actualRotation = rotation || ((deviceSize === 'desktop' || deviceSize === 'laptop') ? 'landscape' : 'portrait');
 
@@ -295,7 +368,8 @@ export class BrowserPreviewService extends EventEmitter {
 		// Create tab
 		const tab = await this.tabManager.createTab(url, deviceSize, actualRotation, {
 			setActive: true,
-			preNavigationSetup
+			preNavigationSetup,
+			launchId
 		});
 
 		// Setup console, navigation tracking, and pre-inject streaming scripts in parallel
@@ -308,6 +382,8 @@ export class BrowserPreviewService extends EventEmitter {
 		// Fire-and-forget: failure here is non-fatal, startStreaming() will retry injection
 		this.videoCapture.preInjectScripts(tab.id, tab).catch(() => {});
 
+		this.lifecycle.register(tab.id);
+
 		await this.captureHistoryBase(tab.id);
 		void this.refreshTabMeta(tab.id);
 
@@ -315,9 +391,99 @@ export class BrowserPreviewService extends EventEmitter {
 	}
 
 	/**
+	 * Rebuild a tab whose page died, in place.
+	 *
+	 * A crashed renderer, a Chrome that went away, a page a site closed on
+	 * itself: every one of these used to delete the tab, which is how a preview
+	 * could disappear mid-session — while an agent was driving it, even — with
+	 * nobody having closed anything. The tab keeps its id, its slot in the strip
+	 * and its URL; only the page underneath is replaced.
+	 *
+	 * Viewers are told about it as a navigation, because that is exactly what it
+	 * looks like from their side and they already know how to restart a stream
+	 * across one.
+	 */
+	async recoverTab(tabId: string, reason = 'page-gone'): Promise<boolean> {
+		const inFlight = this.tabRecoveries.get(tabId);
+		if (inFlight) return inFlight;
+
+		const run = this.rebuildTab(tabId, reason).finally(() => {
+			this.tabRecoveries.delete(tabId);
+		});
+		this.tabRecoveries.set(tabId, run);
+
+		return run;
+	}
+
+	private async rebuildTab(tabId: string, reason: string): Promise<boolean> {
+		const before = this.tabManager.peekTab(tabId);
+		if (!before || before.isDestroyed) return false;
+
+		debug.warn('preview', `♻️ Rebuilding tab ${tabId} after ${reason}`);
+
+		this.emit('preview:browser-navigation-loading', {
+			sessionId: tabId,
+			type: 'recovery',
+			url: before.url,
+			timestamp: Date.now()
+		});
+
+		// Everything below is bound to the page that died — bindings, injected
+		// scripts, the CDP sessions behind navigation tracking and the host
+		// bridge. All of it is re-applied against the new page.
+		await this.videoCapture.stopStreaming(tabId).catch(() => {});
+		this.videoCapture.disposeTab(tabId);
+		await this.navigationTracker.cleanupSession(tabId).catch(() => {});
+		await this.hostBridge.teardown(tabId).catch(() => {});
+		this.fullscreenTabs.delete(tabId);
+
+		let tab: BrowserTab | null;
+		try {
+			tab = await this.tabManager.respawnPage(tabId);
+		} catch (error) {
+			// Left in place on purpose: the tab stays in the strip and the next
+			// read of it asks for another rebuild, so a host that is briefly out
+			// of memory recovers on its own instead of losing the tab.
+			debug.error('preview', `❌ Rebuild failed for tab ${tabId}:`, error);
+			return false;
+		}
+		if (!tab) return false;
+
+		await Promise.all([
+			this.consoleManager.setupConsoleLogging(tab.id, tab.page, tab),
+			this.navigationTracker.setupNavigationTracking(tab.id, tab.page, tab)
+		]);
+
+		this.videoCapture.preInjectScripts(tab.id, tab).catch(() => {});
+
+		await this.captureHistoryBase(tab.id);
+		void this.refreshTabMeta(tab.id);
+
+		this.emit('preview:browser-navigation', {
+			sessionId: tabId,
+			type: 'recovery',
+			url: tab.url,
+			timestamp: Date.now()
+		});
+
+		// The page it was frozen with is gone; the replacement is running.
+		this.lifecycle.rebind(tabId);
+
+		debug.log('preview', `✅ Tab ${tabId} rebuilt at ${tab.url}`);
+
+		return true;
+	}
+
+	/** Stop a launch the user abandoned before it produced a tab. */
+	async cancelLaunch(launchId: string): Promise<void> {
+		await this.tabManager.cancelLaunch(launchId);
+	}
+
+	/**
 	 * Navigate tab to a new URL
 	 */
 	async navigateTab(tabId: string, url: string): Promise<string> {
+		await this.ensureTabAwake(tabId);
 		const wasBlank = this.getTab(tabId)?.url === 'about:blank';
 
 		const actualUrl = await this.tabManager.navigateTab(tabId, url);
@@ -352,6 +518,7 @@ export class BrowserPreviewService extends EventEmitter {
 	async getHistoryState(tabId: string): Promise<BrowserHistoryState | null> {
 		const tab = this.getTab(tabId);
 		if (!tab) return null;
+		await this.ensureTabAwake(tabId);
 
 		const history = await this.navigationTracker.getNavigationHistory(tabId, tab.page);
 		if (!history) return null;
@@ -496,6 +663,9 @@ export class BrowserPreviewService extends EventEmitter {
 		// Close the tab (this will cleanup context, page, etc.)
 		const result = await this.tabManager.closeTab(tabId);
 
+		this.lifecycle.dispose(tabId);
+		this.consoleManager.forgetSession(tabId);
+
 		// Emit tab closed event (for MCP control manager and other listeners)
 		this.emit('preview:browser-tab-destroyed', { tabId });
 
@@ -512,7 +682,9 @@ export class BrowserPreviewService extends EventEmitter {
 	 * act of looking reassign this made each of them move the other's target.
 	 */
 	switchTab(tabId: string): boolean {
-		return this.tabManager.setActiveTab(tabId);
+		const switched = this.tabManager.setActiveTab(tabId);
+		if (switched) this.lifecycle.touch(tabId);
+		return switched;
 	}
 
 	/**
@@ -525,6 +697,11 @@ export class BrowserPreviewService extends EventEmitter {
 	noteTabViewed(tabId: string): boolean {
 		if (!this.tabManager.getTab(tabId)) return false;
 		this.tabManager.markTabActivity(tabId);
+
+		// Start the thaw here rather than waiting for the stream to ask for it:
+		// the viewer has already committed to this tab, and a wake in flight by
+		// the time the first frame is requested is a wake nobody waits for.
+		this.lifecycle.touch(tabId);
 		return true;
 	}
 
@@ -553,7 +730,58 @@ export class BrowserPreviewService extends EventEmitter {
 	 * Change viewport settings (device size and rotation) for an existing tab
 	 */
 	async setViewport(tabId: string, deviceSize: DeviceSize, rotation: Rotation): Promise<boolean> {
+		await this.ensureTabAwake(tabId);
 		return await this.tabManager.setViewport(tabId, deviceSize, rotation);
+	}
+
+	/**
+	 * Sites this workspace's browser profile holds data for.
+	 *
+	 * The cookie jar is the backbone of the list — every login leaves one —
+	 * but a site can hold storage without a cookie, so the origins currently
+	 * open are folded in too. Anything the user could recognise as "I am
+	 * signed into this" is therefore listed, with something to clear.
+	 */
+	async listBrowsingData(): Promise<BrowserSiteData[]> {
+		const sites = new Map<string, BrowserSiteData>();
+
+		for (const entry of await browserPool.listBrowsingOrigins(this.projectId)) {
+			sites.set(entry.domain, {
+				domain: entry.domain,
+				origin: `${entry.secure ? 'https' : 'http'}://${entry.domain}`,
+				cookies: entry.cookies,
+				open: false
+			});
+		}
+
+		for (const tab of this.tabManager.getAllTabs()) {
+			let url: URL;
+			try {
+				url = new URL(tab.url);
+			} catch {
+				continue; // about:blank and friends store nothing.
+			}
+			if (url.protocol !== 'http:' && url.protocol !== 'https:') continue;
+
+			const existing = sites.get(url.hostname);
+			// The open tab knows the real origin (scheme and port); a cookie
+			// only ever knew the domain, so its guess is replaced here.
+			sites.set(url.hostname, {
+				domain: url.hostname,
+				origin: url.origin,
+				cookies: existing?.cookies ?? 0,
+				open: true
+			});
+		}
+
+		return Array.from(sites.values()).sort(
+			(a, b) => Number(b.open) - Number(a.open) || b.cookies - a.cookies || a.domain.localeCompare(b.domain)
+		);
+	}
+
+	/** Forget one site, or everything this workspace's browser has stored. */
+	async clearBrowsingData(origin?: string): Promise<boolean> {
+		return browserPool.clearBrowsingData(this.projectId, origin);
 	}
 
 	/**
@@ -567,14 +795,18 @@ export class BrowserPreviewService extends EventEmitter {
 	 * Get tab info
 	 */
 	getTabInfo(tabId: string): BrowserTabInfo | null {
-		return this.tabManager.getTabInfo(tabId);
+		const info = this.tabManager.getTabInfo(tabId);
+		if (!info) return null;
+		return { ...info, isSleeping: this.lifecycle.isFrozen(tabId) };
 	}
 
 	/**
 	 * Get all tabs info
 	 */
 	getAllTabsInfo(): BrowserTabInfo[] {
-		return this.tabManager.getAllTabsInfo();
+		return this.tabManager
+			.getAllTabsInfo()
+			.map((info) => ({ ...info, isSleeping: this.lifecycle.isFrozen(info.id) }));
 	}
 
 	/**
@@ -617,12 +849,22 @@ export class BrowserPreviewService extends EventEmitter {
 		if (!tab) {
 			return false;
 		}
-		return await this.videoCapture.startStreaming(
+
+		// Before the capture, not after: the encoder is injected by evaluating
+		// in the page, which a frozen one would never get round to running.
+		await this.ensureTabAwake(tabId);
+		this.lifecycle.attachViewer(tabId, options.viewerId);
+
+		const started = await this.videoCapture.startStreaming(
 			tabId,
 			tab,
 			() => this.isValidTab(tabId),
 			options
 		);
+
+		if (!started) this.lifecycle.detachViewer(tabId, options.viewerId);
+
+		return started;
 	}
 
 	/**
@@ -650,6 +892,16 @@ export class BrowserPreviewService extends EventEmitter {
 		if (!tab) {
 			return false;
 		}
+
+		// A viewer with the preview off screen is not watching: capture is
+		// already suspended for it, so the page has nothing left to run for.
+		if (paused) {
+			this.lifecycle.setViewerVisible(tabId, viewerId, false);
+		} else {
+			await this.ensureTabAwake(tabId);
+			this.lifecycle.setViewerVisible(tabId, viewerId, true);
+		}
+
 		return await this.videoCapture.setViewerVisibility(tabId, tab, viewerId, !paused);
 	}
 
@@ -659,6 +911,9 @@ export class BrowserPreviewService extends EventEmitter {
 	 */
 	async stopWebCodecsStreaming(tabId: string, viewerId?: string): Promise<void> {
 		const tab = this.getTab(tabId);
+
+		if (viewerId) this.lifecycle.detachViewer(tabId, viewerId);
+		else this.lifecycle.dropViewers(tabId);
 
 		if (viewerId) {
 			await this.videoCapture.detachViewer(tabId, tab ?? undefined, viewerId);
@@ -840,6 +1095,7 @@ export class BrowserPreviewService extends EventEmitter {
 
 	markUserInteraction(tabId: string): void {
 		this.tabManager.markTabActivity(tabId);
+		this.lifecycle.touch(tabId);
 	}
 
 	// Public method to mark tab activity (called from WS handlers)
@@ -876,6 +1132,7 @@ export class BrowserPreviewService extends EventEmitter {
 	async executeConsoleCommand(tabId: string, command: string): Promise<any> {
 		const tab = this.getTab(tabId);
 		if (!tab) throw new Error('Tab not found or invalid');
+		await this.ensureTabAwake(tabId);
 		return this.consoleManager.executeConsoleCommand(tab, command);
 	}
 
@@ -901,6 +1158,10 @@ export class BrowserPreviewService extends EventEmitter {
 	): Promise<AutonomousRunOutcome> {
 		const tab = this.getTab(tabId);
 		if (!tab) throw new Error('Tab not found or invalid');
+
+		// An agent drives tabs nobody is looking at, which is exactly the state
+		// this wakes them out of.
+		await this.ensureTabAwake(tabId);
 
 		return this.interactionHandler.performAutonomousActions(
 			tabId,
@@ -1028,7 +1289,8 @@ export class BrowserPreviewService extends EventEmitter {
 		this.interactionHandler.clearAllSessionCursors();
 		// Release host-bridge scratch dirs and unblock any parked page promises
 		await this.hostBridge.cleanup();
-		// Cleanup tabs (this will also cleanup all contexts/pages/browser pool)
+		// Cleanup tabs (contexts and pages go with them). The shared browser
+		// pool is deliberately left alone — it is one Chrome for every project.
 		await this.tabManager.cleanup();
 	}
 
@@ -1037,6 +1299,10 @@ export class BrowserPreviewService extends EventEmitter {
 	}
 
 	async forceCleanupAll() {
+		// Before the tabs go: a frozen page with its lifecycle listener still
+		// attached would emit a wake nobody is left to hear.
+		await this.lifecycle.cleanup();
+
 		// First try normal cleanup
 		await this.cleanup();
 
@@ -1107,13 +1373,18 @@ class BrowserPreviewServiceManager {
 	private setupWebSocketForwarding(service: BrowserPreviewService, projectId: string): void {
 		debug.log('preview', `🔌 Setting up WebSocket forwarding for project: ${projectId}...`);
 
+		// `projectId` is a workspace scope key: it separates a worktree's tabs from
+		// the main tree's. Rooms are keyed by the real project, so events go there
+		// and each client filters on the scope carried in the payload.
+		const roomId = scopeProjectId(projectId);
+
 		// Forward WebCodecs events.
 		//
 		// The room is the whole project, so several viewers of the same tab all
 		// receive these. `viewerId` is what lets each of them recognise the half
 		// of the handshake that is theirs.
 		service.on('preview:browser-webcodecs-ice-candidate', (data) => {
-			ws.emit.project(projectId, 'preview:browser-stream-ice', {
+			ws.emit.project(roomId, 'preview:browser-stream-ice', {
 				sessionId: data.sessionId,
 				viewerId: data.viewerId,
 				candidate: data.candidate,
@@ -1122,25 +1393,25 @@ class BrowserPreviewServiceManager {
 		});
 
 		service.on('preview:browser-webcodecs-connection-state', (data) => {
-			ws.emit.project(projectId, 'preview:browser-stream-state', data);
+			ws.emit.project(roomId, 'preview:browser-stream-state', data);
 		});
 
 		service.on('preview:browser-cursor-change', (data) => {
-			ws.emit.project(projectId, 'preview:browser-cursor-change', data);
+			ws.emit.project(roomId, 'preview:browser-cursor-change', data);
 		});
 
 		// Forward navigation events
 		service.on('preview:browser-navigation-loading', (data) => {
-			ws.emit.project(projectId, 'preview:browser-navigation-loading', data);
+			ws.emit.project(roomId, 'preview:browser-navigation-loading', data);
 		});
 
 		service.on('preview:browser-navigation', (data) => {
-			ws.emit.project(projectId, 'preview:browser-navigation', data);
+			ws.emit.project(roomId, 'preview:browser-navigation', data);
 		});
 
 		// Forward SPA navigation events (pushState/replaceState — URL-only update)
 		service.on('preview:browser-navigation-spa', (data) => {
-			ws.emit.project(projectId, 'preview:browser-navigation-spa', data);
+			ws.emit.project(roomId, 'preview:browser-navigation-spa', data);
 		});
 
 		// Forward tab events. Each carries projectId so the frontend can drop
@@ -1149,113 +1420,120 @@ class BrowserPreviewServiceManager {
 		// project the user is now viewing.
 		service.on('preview:browser-tab-opened', (data) => {
 			debug.log('preview', `🚀 Forwarding preview:browser-tab-opened to project ${projectId}:`, data);
-			ws.emit.project(projectId, 'preview:browser-tab-opened', { ...data, projectId });
+			ws.emit.project(roomId, 'preview:browser-tab-opened', { ...data, projectId });
 		});
 
 		service.on('preview:browser-tab-closed', (data) => {
-			ws.emit.project(projectId, 'preview:browser-tab-closed', { ...data, projectId });
+			ws.emit.project(roomId, 'preview:browser-tab-closed', { ...data, projectId });
 		});
 
 		service.on('preview:browser-tab-switched', (data) => {
-			ws.emit.project(projectId, 'preview:browser-tab-switched', { ...data, projectId });
+			ws.emit.project(roomId, 'preview:browser-tab-switched', { ...data, projectId });
+		});
+
+		// A page frozen because nobody was watching, or woken because someone
+		// is. Carries the scope like every other tab event so a client that has
+		// switched workspace drops it.
+		service.on('preview:browser-tab-lifecycle', (data) => {
+			ws.emit.project(roomId, 'preview:browser-tab-lifecycle', { ...data, projectId });
 		});
 
 		service.on('preview:browser-tab-navigated', (data) => {
-			ws.emit.project(projectId, 'preview:browser-tab-navigated', { ...data, projectId });
+			ws.emit.project(roomId, 'preview:browser-tab-navigated', { ...data, projectId });
 		});
 
 		service.on('preview:browser-viewport-changed', (data) => {
-			ws.emit.project(projectId, 'preview:browser-viewport-changed', { ...data, projectId });
+			ws.emit.project(roomId, 'preview:browser-viewport-changed', { ...data, projectId });
 		});
 
 		service.on('preview:browser-fullscreen-state', (data) => {
-			ws.emit.project(projectId, 'preview:browser-fullscreen-state', { ...data, projectId });
+			ws.emit.project(roomId, 'preview:browser-fullscreen-state', { ...data, projectId });
 		});
 
 		// Forward live tab metadata (title, favicon, back/forward availability)
 		service.on('preview:browser-tab-meta', (data) => {
-			ws.emit.project(projectId, 'preview:browser-tab-meta', { ...data, projectId });
+			ws.emit.project(roomId, 'preview:browser-tab-meta', { ...data, projectId });
 		});
 
 		// Forward host-capability requests (geolocation, camera, clipboard, …)
 		// and relayed downloads — both are answered by the viewer's own browser.
 		service.on('preview:browser-host-request', (data) => {
-			ws.emit.project(projectId, 'preview:browser-host-request', data);
+			ws.emit.project(roomId, 'preview:browser-host-request', data);
 		});
 
 		// Answered (or expired) — every viewer that was shown this prompt drops it.
 		service.on('preview:browser-host-request-settled', (data) => {
-			ws.emit.project(projectId, 'preview:browser-host-request-settled', data);
+			ws.emit.project(roomId, 'preview:browser-host-request-settled', data);
 		});
 
 		service.on('preview:browser-download', (data) => {
-			ws.emit.project(projectId, 'preview:browser-download', data);
+			ws.emit.project(roomId, 'preview:browser-download', data);
 		});
 
 		// Forward console events
 		service.on('preview:browser-console-message', (data) => {
-			ws.emit.project(projectId, 'preview:browser-console-message', data);
+			ws.emit.project(roomId, 'preview:browser-console-message', data);
 		});
 
 		service.on('preview:browser-console-clear', (data) => {
-			ws.emit.project(projectId, 'preview:browser-console-clear', data);
+			ws.emit.project(roomId, 'preview:browser-console-clear', data);
 		});
 
 		// Forward dialog events
 		service.on('preview:browser-dialog', (data) => {
-			ws.emit.project(projectId, 'preview:browser-dialog', data);
+			ws.emit.project(roomId, 'preview:browser-dialog', data);
 		});
 
 		// A dialog belongs to the page, not to whoever answered it: every viewer
 		// was shown the same prompt, so all of them are told it is settled.
 		service.on('preview:browser-dialog-closed', (data) => {
-			ws.emit.project(projectId, 'preview:browser-dialog-closed', data);
+			ws.emit.project(roomId, 'preview:browser-dialog-closed', data);
 		});
 
 		service.on('preview:browser-print', (data) => {
-			ws.emit.project(projectId, 'preview:browser-print', data);
+			ws.emit.project(roomId, 'preview:browser-print', data);
 		});
 
 		// Forward native UI events
 		service.on('preview:browser-native-picker', (data) => {
-			ws.emit.project(projectId, 'preview:browser-native-picker', data);
+			ws.emit.project(roomId, 'preview:browser-native-picker', data);
 		});
 
 		service.on('preview:browser-select', (data) => {
-			ws.emit.project(projectId, 'preview:browser-select', data);
+			ws.emit.project(roomId, 'preview:browser-select', data);
 		});
 
 		service.on('preview:browser-context-menu', (data) => {
-			ws.emit.project(projectId, 'preview:browser-context-menu', data);
+			ws.emit.project(roomId, 'preview:browser-context-menu', data);
 		});
 
 		service.on('preview:browser-copy-to-clipboard', (data) => {
-			ws.emit.project(projectId, 'preview:browser-copy-to-clipboard', data);
+			ws.emit.project(roomId, 'preview:browser-copy-to-clipboard', data);
 		});
 
 		service.on('preview:browser-open-url-new-tab', (data) => {
-			ws.emit.project(projectId, 'preview:browser-open-url-new-tab', data);
+			ws.emit.project(roomId, 'preview:browser-open-url-new-tab', data);
 		});
 
 		service.on('preview:browser-download-image', (data) => {
-			ws.emit.project(projectId, 'preview:browser-download-image', data);
+			ws.emit.project(roomId, 'preview:browser-download-image', data);
 		});
 
 		service.on('preview:browser-open-url-host', (data) => {
-			ws.emit.project(projectId, 'preview:browser-open-url-host', data);
+			ws.emit.project(roomId, 'preview:browser-open-url-host', data);
 		});
 
 		service.on('preview:browser-open-inspector', (data) => {
-			ws.emit.project(projectId, 'preview:browser-open-inspector', data);
+			ws.emit.project(roomId, 'preview:browser-open-inspector', data);
 		});
 
 		service.on('preview:browser-copy-image-to-clipboard', (data) => {
-			ws.emit.project(projectId, 'preview:browser-copy-image-to-clipboard', data);
+			ws.emit.project(roomId, 'preview:browser-copy-image-to-clipboard', data);
 		});
 
 		// Forward new window events
 		service.on('preview:browser-new-window', (data) => {
-			ws.emit.project(projectId, 'preview:browser-new-window', data);
+			ws.emit.project(roomId, 'preview:browser-new-window', data);
 		});
 
 		// MCP control events come from the singleton browserMcpControl, so their
@@ -1290,6 +1568,12 @@ class BrowserPreviewServiceManager {
 		browserMcpControl.on('control-start', (data) => {
 			debug.log('preview', '🚀 Forwarding mcp-control-start:', data);
 			if (!data.projectId) return;
+
+			// The tab is now pinned awake; if it was asleep, start the thaw
+			// before the agent's first action asks for it.
+			if (this.services.get(data.projectId)?.isTabSleeping(data.browserTabId)) {
+				void this.services.get(data.projectId)?.ensureTabAwake(data.browserTabId);
+			}
 			ws.emit.project(data.projectId, 'preview:browser-mcp-control-start', {
 				browserTabId: data.browserTabId,
 				chatSessionId: data.chatSessionId,
@@ -1301,6 +1585,10 @@ class BrowserPreviewServiceManager {
 		browserMcpControl.on('control-end', (data) => {
 			debug.log('preview', '🚀 Forwarding mcp-control-end:', data);
 			if (!data.projectId) return;
+
+			// No longer pinned: an unwatched tab the agent has let go of is free
+			// to fall asleep on the usual timer.
+			this.services.get(data.projectId)?.noteTabActivity(data.browserTabId);
 			ws.emit.project(data.projectId, 'preview:browser-mcp-control-end', {
 				browserTabId: data.browserTabId,
 				projectId: data.projectId,
@@ -1390,6 +1678,12 @@ class BrowserPreviewServiceManager {
 
 		await Promise.all(cleanupPromises);
 		this.services.clear();
+
+		// The only place the shared browser may be closed: this is every
+		// project at once, i.e. the process going away. A single workspace's
+		// teardown must never reach it — doing so took every other project's
+		// preview tabs down with it.
+		await browserPool.cleanup();
 	}
 
 	/**

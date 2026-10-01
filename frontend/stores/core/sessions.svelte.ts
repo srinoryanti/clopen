@@ -11,11 +11,11 @@ import type { ChatSession } from '$shared/types/database/schema';
 import type { UnifiedMessage, UserMessage } from '$shared/types/unified';
 import ws, { onWsReconnect } from '$frontend/utils/ws';
 import { projectState } from './projects.svelte';
-import { setupEditModeListener, restoreEditMode } from '$frontend/stores/ui/edit-mode.svelte';
+import { setupEditModeListener, resetEditModeQuietly } from '$frontend/stores/ui/edit-mode.svelte';
+import { setupMessageQueueListener } from '$frontend/stores/ui/message-queue.svelte';
 import { markSessionUnread, markSessionRead, clearSessionState, syncGlobalStateFromSession, appState } from '$frontend/stores/core/app.svelte';
 import { debug } from '$shared/utils/logger';
-import { setAiChanges } from '$frontend/utils/ai-changes';
-import { extractAiEdits } from '$frontend/utils/chat/ai-edits-from-messages';
+import { loadAiChanges, clearAiChanges } from '$frontend/stores/features/ai-changes.svelte';
 
 /**
  * Frontend-only streaming message for assistant text or reasoning.
@@ -113,11 +113,20 @@ export async function setCurrentSession(session: ChatSession | null, skipLoadMes
 	const previousSessionId = sessionState.currentSession?.id;
 	sessionState.currentSession = session;
 
+	// Edit mode is per session: the previous session's edit stays on the server
+	// for when the user comes back, and the composer restores this one's.
+	if (previousSessionId !== session?.id) resetEditModeQuietly();
+
 	// Re-derive the global convenience flags from the session now on screen.
 	// Without this the previous session's state (e.g. isWaitingInput) lingers
 	// and leaks into the newly-viewed session/project. A genuinely-waiting
 	// session re-detects its state via catchupActiveStream on switch.
 	syncGlobalStateFromSession(session?.id ?? null);
+
+	// Point the workspace at the tree this session runs in, before anything else
+	// asks the server for files, terminals or preview tabs.
+	const { syncWorktreeContextFromSession } = await import('$frontend/stores/features/worktrees.svelte');
+	await syncWorktreeContextFromSession(session);
 
 	// Clear unread status when viewing a session
 	if (session) {
@@ -148,6 +157,8 @@ export async function setCurrentSession(session: ChatSession | null, skipLoadMes
 					sessionState.sessions[idx] = freshSession;
 				}
 				sessionState.currentSession = freshSession;
+
+				await syncWorktreeContextFromSession(freshSession);
 			}
 		} catch {
 			// Ignore - proceed with existing session data
@@ -157,6 +168,10 @@ export async function setCurrentSession(session: ChatSession | null, skipLoadMes
 		// messages — those already belong to this session, so claim them).
 		if (skipLoadMessages) {
 			sessionState.messagesSessionId = session.id;
+			// Messages were kept, but the checkpoint they sit on may not be: this is
+			// the restore path, and which turns are on the active path is exactly
+			// what a restore changes.
+			void loadAiChanges(session.id);
 		} else {
 			await loadMessagesForSession(session.id);
 		}
@@ -166,15 +181,20 @@ export async function setCurrentSession(session: ChatSession | null, skipLoadMes
 		// Clear messages when no session
 		sessionState.messages = [];
 		sessionState.messagesSessionId = null;
-		syncAiChangesFromMessages();
+		clearAiChanges();
 		debug.log('session', 'Session cleared');
 	}
 }
 
-export async function createSession(projectId: string, title: string, forceNew: boolean = false): Promise<ChatSession | null> {
+export async function createSession(projectId: string, title: string, forceNew: boolean = false, worktreeId?: string | null): Promise<ChatSession | null> {
 	try {
+		// A new chat inherits the tree the user is currently working in, unless the
+		// caller names one explicitly (the "new isolated chat" shortcut).
+		const { worktreeState } = await import('$frontend/stores/features/worktrees.svelte');
+		const targetWorktreeId = worktreeId === undefined ? worktreeState.activeId : worktreeId;
+
 		// For shared sessions, we want to get or create a shared session for the project
-		const session = await ws.http('sessions:get-shared', { forceNew });
+		const session = await ws.http('sessions:get-shared', { forceNew, worktreeId: targetWorktreeId });
 
 		// When forceNew is true, mark all other sessions for this project as ended in frontend state
 		// This ensures switching projects and back won't restore the old session
@@ -203,9 +223,9 @@ export async function createSession(projectId: string, title: string, forceNew: 
 	}
 }
 
-export async function createNewChatSession(projectId: string): Promise<ChatSession | null> {
+export async function createNewChatSession(projectId: string, worktreeId?: string | null): Promise<ChatSession | null> {
 	// Force create a new session (ends current shared session if exists)
-	return createSession(projectId, 'New Chat Session', true);
+	return createSession(projectId, 'New Chat Session', true, worktreeId);
 }
 
 export function updateSession(updatedSession: ChatSession) {
@@ -236,7 +256,7 @@ export function removeSession(sessionId: string) {
 		sessionState.currentSession = null;
 		sessionState.messages = [];
 		sessionState.messagesSessionId = null;
-		syncAiChangesFromMessages();
+		clearAiChanges();
 	}
 }
 
@@ -260,24 +280,6 @@ export async function endSession(sessionId: string) {
 // MESSAGE MANAGEMENT
 // ========================================
 
-// Signature of the last synced edit set — skip rebuilds when nothing relevant
-// changed (e.g. streaming text deltas that add no completed AI edit).
-let lastAiEditSignature = '';
-
-/**
- * Re-derive the AI-change store from the messages currently in view. Called
- * whenever the message set changes (session/checkpoint/history/project switch,
- * clear) and reactively from ChatMessages for live streaming edits, so the AI
- * indicators always reflect exactly what the user is looking at.
- */
-export function syncAiChangesFromMessages() {
-	const entries = extractAiEdits(sessionState.messages);
-	const signature = entries.map((e) => e.key).join('|');
-	if (signature === lastAiEditSignature) return;
-	lastAiEditSignature = signature;
-	setAiChanges(entries);
-}
-
 export function addMessage(message: UnifiedMessage): void {
 	sessionState.messages.push(message);
 }
@@ -290,7 +292,7 @@ export function clearMessages() {
 	sessionState.messages = [];
 	sessionState.messagesSessionId = null;
 	sessionState.hasMessageHistory = false;
-	syncAiChangesFromMessages();
+	clearAiChanges();
 }
 
 export async function loadMessagesForSession(sessionId: string) {
@@ -320,9 +322,11 @@ export async function loadMessagesForSession(sessionId: string) {
 		sessionState.messagesSessionId = null;
 		sessionState.hasMessageHistory = false;
 	} finally {
-		// Re-derive AI-change indicators for whatever is now loaded (incl. after a
-		// checkpoint restore, which truncates messages to the checkpoint).
-		syncAiChangesFromMessages();
+		// Re-read which turns changed what. This runs on every message load, which
+		// includes a checkpoint restore — the restore moves HEAD, and the turns
+		// that are no longer on the active path describe files that no longer
+		// carry their changes.
+		void loadAiChanges(sessionId);
 	}
 }
 
@@ -377,18 +381,13 @@ export async function loadSessions() {
 						}
 
 						debug.log('session', 'Auto-restoring session for project:', targetSession.id);
-						// Load messages BEFORE setting session to avoid race condition:
-						// Setting session triggers $effect → catchupActiveStream (async),
-						// but loadMessagesForSession replaces sessionState.messages entirely,
-						// wiping out any stream_event injected by catchup.
+						// Messages first: adopting the session triggers catchupActiveStream,
+						// and loadMessagesForSession would overwrite what it injected.
 						await loadMessagesForSession(targetSession.id);
-						sessionState.currentSession = targetSession;
-						// Clear unread status — user is actively viewing this session
-						markSessionRead(targetSession.id);
-						// Join chat session room so we receive session-scoped events
-						// (stream, input sync, edit mode, model sync).
-						// Critical after refresh — without it, connection misses all events.
-						ws.emit('chat:join-session', { chatSessionId: targetSession.id });
+						// Adopt via setCurrentSession, not a direct assignment: it re-points the
+						// workspace at the session's tree, joins the chat room and clears unread.
+						// Assigning skipped all three, so a refresh in a worktree returned to Main.
+						await setCurrentSession(targetSession, true);
 					}
 				}
 			}
@@ -520,6 +519,7 @@ export async function initializeSessions() {
 	// Setup sync listeners first (no await needed)
 	setupCollaborativeListeners();
 	setupEditModeListener();
+	setupMessageQueueListener();
 
 	// Skip loading if no project is active — both calls require WS project context
 	if (!projectState.currentProject) {
@@ -527,11 +527,7 @@ export async function initializeSessions() {
 		return;
 	}
 
-	// Load sessions and restore edit mode in parallel
-	// Both only need WS project context (already set by initializeProjects)
-	await Promise.all([
-		loadSessions(),
-		restoreEditMode()
-	]);
+	// Edit mode and drafts are restored per session by the composer
+	await loadSessions();
 	debug.log('session', 'Sessions initialized');
 }

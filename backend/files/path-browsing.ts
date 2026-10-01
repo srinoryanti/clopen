@@ -2,6 +2,7 @@ import { join, extname } from 'path';
 import { readdir as fsReaddir } from 'node:fs/promises';
 import { existsSync } from 'fs';
 
+import { naturalCompare } from '$shared/utils/compare';
 import { debug } from '$shared/utils/logger';
 
 // Cross-platform readdir using fs.promises
@@ -170,7 +171,7 @@ export async function handlePathBrowsing(path: string): Promise<PathBrowseData> 
 			if (a.type !== b.type) {
 				return a.type === 'directory' ? -1 : 1;
 			}
-			return a.name.localeCompare(b.name);
+			return naturalCompare(a.name, b.name);
 		});
 
 		return {
@@ -345,28 +346,34 @@ export async function handleWindowsDrives(): Promise<PathBrowseData> {
 		extension?: string;
 	}> = [];
 
-	// Get list of available drives using wmic with simple output format
-	const proc = Bun.spawn(['wmic', 'logicaldisk', 'get', 'caption'], {
-		stdout: 'pipe',
-		stderr: 'ignore'
-	});
-	const stdout = await new Response(proc.stdout).text();
-
-	const lines = stdout.split('\n')
-		.map(line => line.trim())
-		.filter(line => line && line !== 'Caption' && line.match(/^[A-Z]:$/));
-
-	for (const drive of lines) {
-		// wmic already validated that these drives exist
-		// Just add them directly without further validation
-		const drivePath = drive + '\\';
-		drives.push({
-			name: `${drive} Drive`,
-			type: 'directory',
-			path: drivePath,
-			modified: new Date().toISOString(),
-			kind: 'drive'
+	// Get list of available drives using wmic with simple output format.
+	// wmic is gone on recent Windows 11 builds (spawn throws) — fall through
+	// to the probe below instead of failing the whole drives listing.
+	try {
+		const proc = Bun.spawn(['wmic', 'logicaldisk', 'get', 'caption'], {
+			stdout: 'pipe',
+			stderr: 'ignore'
 		});
+		const stdout = await new Response(proc.stdout).text();
+
+		const lines = stdout.split('\n')
+			.map(line => line.trim())
+			.filter(line => line && line !== 'Caption' && line.match(/^[A-Z]:$/));
+
+		for (const drive of lines) {
+			// wmic already validated that these drives exist
+			// Just add them directly without further validation
+			const drivePath = drive + '\\';
+			drives.push({
+				name: `${drive} Drive`,
+				type: 'directory',
+				path: drivePath,
+				modified: new Date().toISOString(),
+				kind: 'drive'
+			});
+		}
+	} catch {
+		debug.debug('file', 'wmic unavailable, probing drive letters instead');
 	}
 
 	if (drives.length === 0) {

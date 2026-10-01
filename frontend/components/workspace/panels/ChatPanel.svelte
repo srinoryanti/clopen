@@ -10,13 +10,12 @@
 	import TaskProgress from '$frontend/components/chat/widgets/TaskProgress.svelte';
 	import RateLimit from '$frontend/components/chat/widgets/RateLimit.svelte';
 	import TimelineModal from '$frontend/components/checkpoint/TimelineModal.svelte';
+	import CreateWorktreeModal from '$frontend/components/worktree/CreateWorktreeModal.svelte';
 	import Icon from '$frontend/components/common/display/Icon.svelte';
 	import Button from '$frontend/components/common/display/Button.svelte';
 	import { debug } from '$shared/utils/logger';
 	import ws from '$frontend/utils/ws';
 	import { chatService } from '$frontend/services/chat/chat.service';
-	import { setSkipNextRestore } from '$frontend/stores/ui/chat-input.svelte';
-	import { userStore } from '$frontend/stores/features/user.svelte';
 	import { cancelEdit, editModeState } from '$frontend/stores/ui/edit-mode.svelte';
 
 	// Props
@@ -44,6 +43,9 @@
 
 	// Checkpoints modal state
 	let showCheckpoints = $state(false);
+
+	// "New isolated chat" — creating the worktree also lands a session in it.
+	let showNewWorktree = $state(false);
 
 	function openCheckpoints() {
 		showCheckpoints = true;
@@ -160,18 +162,8 @@
 			chatService.resetForSessionSwitch();
 		}
 
-		// Clear server input state and prevent stale restore on ChatInput remount
-		setSkipNextRestore(true);
-		const currentUserId = userStore.currentUser?.id;
-		const currentChatSessionId = sessionState.currentSession?.id;
-		if (currentUserId && currentChatSessionId) {
-			ws.emit('chat:input-sync', {
-				text: '',
-				senderId: currentUserId,
-				chatSessionId: currentChatSessionId,
-				attachments: []
-			});
-		}
+		// The old session keeps its draft: the composer saves it on the switch
+		// and restores it if the user comes back.
 
 		// Clear messages for local view
 		clearMessages();
@@ -201,6 +193,7 @@
 	export const panelActions = {
 		checkpoints: openCheckpoints,
 		newChat: startNewChat,
+		newIsolatedChat: () => { showNewWorktree = true; },
 		hasMessages: () => sessionState.messages.length > 0
 	};
 </script>
@@ -272,6 +265,11 @@
 				{/if}
 			{/if}
 		</div>
+
+		<CreateWorktreeModal
+			bind:isOpen={showNewWorktree}
+			onClose={() => (showNewWorktree = false)}
+		/>
 
 		<!-- Checkpoint Modal -->
 		<TimelineModal

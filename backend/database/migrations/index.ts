@@ -68,6 +68,20 @@ import * as migration066 from './066_create_memory_graph';
 import * as migration067 from './067_add_memory_graph_layout';
 import * as migration068 from './068_create_engine_config_revision';
 import * as migration069 from './069_create_ssh_client_tables';
+import * as migration070 from './070_create_worktrees_table';
+import * as migration071 from './071_create_notes_tables';
+import * as migration072 from './072_encrypt_stored_secrets';
+import * as migration073 from './073_create_integration_tables';
+import * as migration074 from './074_create_work_tables';
+import * as migration075 from './075_create_deploy_bindings';
+import * as migration076 from './076_remove_memory_code_graph';
+import * as migration077 from './077_create_integration_db_links';
+import * as migration078 from './078_create_worktree_branch_tables';
+import * as migration079 from './079_merge_commands_into_skills';
+import * as migration080 from './080_create_file_shares';
+import * as migration081 from './081_create_push_subscriptions';
+import * as migration082 from './082_create_git_identities';
+import * as migration083 from './083_create_project_mcp_trust';
 
 // Export all migrations in order
 export const migrations = [
@@ -484,6 +498,90 @@ export const migrations = [
 		description: migration069.description,
 		up: migration069.up,
 		down: migration069.down
+	},
+	{
+		id: '070',
+		description: migration070.description,
+		up: migration070.up,
+		down: migration070.down
+	},
+	{
+		id: '071',
+		description: migration071.description,
+		up: migration071.up,
+		down: migration071.down
+	},
+	{
+		id: '072',
+		description: migration072.description,
+		up: migration072.up,
+		down: migration072.down
+	},
+	{
+		id: '073',
+		description: migration073.description,
+		up: migration073.up,
+		down: migration073.down
+	},
+	{
+		id: '074',
+		description: migration074.description,
+		up: migration074.up,
+		down: migration074.down
+	},
+	{
+		id: '075',
+		description: migration075.description,
+		up: migration075.up,
+		down: migration075.down
+	},
+	{
+		id: '076',
+		description: migration076.description,
+		up: migration076.up,
+		down: migration076.down
+	},
+	{
+		id: '077',
+		description: migration077.description,
+		up: migration077.up,
+		down: migration077.down
+	},
+	{
+		id: '078',
+		description: migration078.description,
+		up: migration078.up,
+		down: migration078.down
+	},
+	{
+		id: '079',
+		description: migration079.description,
+		up: migration079.up,
+		down: migration079.down
+	},
+	{
+		id: '080',
+		description: migration080.description,
+		up: migration080.up,
+		down: migration080.down
+	},
+	{
+		id: '081',
+		description: migration081.description,
+		up: migration081.up,
+		down: migration081.down
+	},
+	{
+		id: '082',
+		description: migration082.description,
+		up: migration082.up,
+		down: migration082.down
+	},
+	{
+		id: '083',
+		description: migration083.description,
+		up: migration083.up,
+		down: migration083.down
 	}
 ];
 
